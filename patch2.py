@@ -1,0 +1,88 @@
+TRAIN = r'e:\FInal Year Project\LDACode\train.py'
+with open(TRAIN, 'r', encoding='utf-8') as f:
+    c = f.read()
+
+# P3: Insert FAA + Riemannian + EA functions before LOAD TRAINING DATA
+load_idx   = c.find('# LOAD TRAINING DATA\n')
+assert load_idx != -1, 'load anchor not found'
+block_start = c.rfind('\n# \u2550', 0, load_idx) + 1
+
+NEW_FUNCS = (
+    '# ===============================================================\n'
+    '# FAA -- Frontal Alpha Asymmetry  (14 features)\n'
+    '# Channel order: 0=TP9  1=AF7(left)  2=AF8(right)  3=TP10\n'
+    '# FAA = log(alpha_AF8) - log(alpha_AF7)\n'
+    '# Reference: Davidson 1992; Harmon-Jones & Allen 1997\n'
+    '# ===============================================================\n'
+    'def extract_faa_features(eeg_4ch, sr=EEG_SR):\n'
+    '    feats = []\n'
+    '    ALPHA=(8,13); BETA=(13,30); THETA=(4,8); GAMMA=(30,45); DELTA=(1,4)\n'
+    '    def _logbp(sig, lo, hi):\n'
+    '        freqs, psd = _compute_psd(sig, sr)\n'
+    '        return float(np.log(_band_power(freqs, psd, lo, hi) + 1e-12))\n'
+    '    feats.append(_logbp(eeg_4ch[2],*ALPHA) - _logbp(eeg_4ch[1],*ALPHA))  # 1 core FAA\n'
+    '    feats.append(_logbp(eeg_4ch[2],*BETA)  - _logbp(eeg_4ch[1],*BETA))   # 2 frontal beta asym\n'
+    '    feats.append(_logbp(eeg_4ch[2],*THETA) - _logbp(eeg_4ch[1],*THETA))  # 3 frontal theta asym\n'
+    '    feats.append(_logbp(eeg_4ch[2],*GAMMA) - _logbp(eeg_4ch[1],*GAMMA))  # 4 frontal gamma asym\n'
+    '    for lo,hi in [ALPHA,BETA,THETA,GAMMA,DELTA]:                          # 5-9 posterior asym\n'
+    '        feats.append(_logbp(eeg_4ch[3],lo,hi) - _logbp(eeg_4ch[0],lo,hi))\n'
+    '    a7=_logbp(eeg_4ch[1],*ALPHA); a8=_logbp(eeg_4ch[2],*ALPHA)\n'
+    '    a9=_logbp(eeg_4ch[0],*ALPHA); a10=_logbp(eeg_4ch[3],*ALPHA)\n'
+    '    feats.append((a8-a7)/(abs(a8+a7)+1e-8))                              # 10 frontal lat index\n'
+    '    feats.append((a10-a9)/(abs(a10+a9)+1e-8))                            # 11 posterior lat index\n'
+    '    b7=_logbp(eeg_4ch[1],*BETA); b8=_logbp(eeg_4ch[2],*BETA)\n'
+    '    feats.append(a7/(a7+b7+1e-8))                                        # 12 AF7 engagement\n'
+    '    feats.append(a8/(a8+b8+1e-8))                                        # 13 AF8 engagement\n'
+    '    t7=_logbp(eeg_4ch[1],*THETA); t8=_logbp(eeg_4ch[2],*THETA)\n'
+    '    feats.append(((t7+t8)/2)/((a7+a8)/2+1e-8))                          # 14 theta/alpha ratio\n'
+    '    return safe_array(np.array(feats, dtype=np.float32))\n'
+    '\n'
+    '\n'
+    '# ===============================================================\n'
+    '# RIEMANNIAN GEOMETRY -- tangent space of SPD manifold (10 features)\n'
+    '# Steps: regularised cov -> matrix log -> upper triangle\n'
+    '# Reference: Barachant et al. 2010, 2012\n'
+    '# ===============================================================\n'
+    'def _sym_matrix_logm(M):\n'
+    '    v, U = np.linalg.eigh(M)\n'
+    '    return U @ np.diag(np.log(np.maximum(v, 1e-10))) @ U.T\n'
+    '\n'
+    'def _regularised_cov(X, reg=1e-4):\n'
+    '    C, T = X.shape\n'
+    '    Xc = X - X.mean(axis=1, keepdims=True)\n'
+    '    cov = (Xc @ Xc.T) / (T - 1)\n'
+    '    return (1-reg)*cov + reg*(np.trace(cov)/C)*np.eye(C)\n'
+    '\n'
+    'def extract_riemannian_features(eeg_4ch):\n'
+    '    cov  = _regularised_cov(eeg_4ch.astype(np.float64))\n'
+    '    logC = _sym_matrix_logm(cov)\n'
+    '    return safe_array(logC[np.triu_indices(4)].astype(np.float32))\n'
+    '\n'
+    '\n'
+    '# ===============================================================\n'
+    '# EUCLIDEAN ALIGNMENT  (He & Wu 2019)\n'
+    '# C_aligned = R^{-1/2} @ C @ R^{-1/2},  R = mean SPD cov\n'
+    '# Unsupervised per-subject domain adaptation on SPD manifold\n'
+    '# ===============================================================\n'
+    'def _matrix_sqrt_inv(M):\n'
+    '    v, U = np.linalg.eigh(M)\n'
+    '    return U @ np.diag(1.0/np.sqrt(np.maximum(v, 1e-10))) @ U.T\n'
+    '\n'
+    'def euclidean_alignment(eeg_windows_list):\n'
+    '    covs = [_regularised_cov(w.astype(np.float64)) for w in eeg_windows_list]\n'
+    '    R    = np.stack(covs, axis=0).mean(axis=0)\n'
+    '    Rinv = _matrix_sqrt_inv(R)\n'
+    '    return [Rinv @ w.astype(np.float64) for w in eeg_windows_list]\n'
+    '\n'
+    '\n'
+)
+
+c = c[:block_start] + NEW_FUNCS + c[block_start:]
+assert 'extract_faa_features' in c, 'P3 FAA missing'
+assert 'extract_riemannian_features' in c, 'P3 Riem missing'
+assert 'euclidean_alignment' in c, 'P3 EA missing'
+print('P3 ok')
+
+with open(TRAIN, 'w', encoding='utf-8') as f:
+    f.write(c)
+print('patch2 saved')
