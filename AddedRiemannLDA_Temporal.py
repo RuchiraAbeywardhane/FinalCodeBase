@@ -103,10 +103,10 @@ N_FEAT_BVP  = 7
 N_FEAT_HR   = 5
 N_FEAT_PPI  = 8
 N_FEAT_FAA  = 14   # Frontal Alpha Asymmetry + hemispheric asymmetries
-N_FEAT_RIEM = 10   # Riemannian tangent-space upper triangle of 4x4 log-cov
+N_FEAT_RIEM  = 10   # Riemannian tangent-space upper triangle of 4x4 log-cov
+N_FEAT_WPOS  = 1    # normalised window position within trial
 N_FEATURES_RAW = (N_FEAT_EEG + N_FEAT_MUSE + N_FEAT_BVP +
-                  N_FEAT_HR  + N_FEAT_PPI  + N_FEAT_FAA + N_FEAT_RIEM)
-
+                  N_FEAT_HR  + N_FEAT_PPI  + N_FEAT_FAA + N_FEAT_RIEM + N_FEAT_WPOS)
 print(f"Raw feature count = {N_FEATURES_RAW}")
 
 # ???????????????????????????????????????????????????????????????
@@ -792,8 +792,11 @@ for ti, tr in enumerate(train_trials):
         f_faa  = extract_faa_features(ew)          # 14 FAA features
         f_riem = extract_riemannian_features(ew)   # 10 Riemannian (pre-EA)
 
+        # Normalised window position: 0.0=trial start, 1.0=trial end
+        win_pos_feat = np.array([float(wi) / float(max(n_wins - 1, 1))], dtype=np.float32)
+
         feat = np.concatenate(
-            [f_eeg, f_muse, f_bvp, f_hr, f_ppi, f_faa, f_riem]
+            [f_eeg, f_muse, f_bvp, f_hr, f_ppi, f_faa, f_riem, win_pos_feat]
         ).astype(np.float32)
 
         all_feat_w.append(feat)
@@ -846,52 +849,34 @@ for sid in sorted(_sid_to_ew.keys()):
 print("EA done -- Riemannian features updated with subject-aligned covariances.")
 
 # ================================================================
-# DELTA FEATURES  (first-order temporal difference per trial)
+# DELTA FEATURES  (first-order diff on z-scored features per trial)
+# Computed AFTER normalisation so all features are on same scale.
 # ================================================================
-print("Computing delta features ...")
-delta_raw = np.zeros_like(allF_raw)
-for _tkey in sorted(set(allTK)):
-    _idx = np.where(allTK == _tkey)[0]
-    for _i in range(1, len(_idx)):
-        delta_raw[_idx[_i]] = allF_raw[_idx[_i]] - allF_raw[_idx[_i - 1]]
-allF_raw       = np.concatenate([allF_raw, delta_raw], axis=1)
-N_FEATURES_RAW = allF_raw.shape[1]
-print(f"Delta features added -- new raw feature count = {N_FEATURES_RAW}")
+def add_delta_features(F_n, trial_keys):
+    delta = np.zeros_like(F_n)
+    for tkey in sorted(set(trial_keys)):
+        idx = np.where(trial_keys == tkey)[0]
+        for i in range(1, len(idx)):
+            delta[idx[i]] = F_n[idx[i]] - F_n[idx[i - 1]]
+    return np.concatenate([F_n, delta], axis=1)
 
 # ================================================================
-# HMM HELPERS  (Viterbi smoothing -- pure numpy, no extra deps)
+# WEIGHTED TRIAL VOTE
+# Later windows carry more weight -- emotion builds across the trial
+# weight ramp: 0.5 (first window) -> 1.5 (last window)
 # ================================================================
-def learn_transition_matrix(label_seqs, num_classes=NUM_CLASSES, smoothing=1.0):
-    T = np.ones((num_classes, num_classes)) * smoothing
-    for seq in label_seqs:
-        for i in range(len(seq) - 1):
-            T[int(seq[i]), int(seq[i + 1])] += 1
-    return (T / T.sum(axis=1, keepdims=True)).astype(np.float64)
+def weighted_trial_vote(probs, num_classes=NUM_CLASSES):
+    T = len(probs)
+    if T == 1:
+        mean_prob = probs[0]
+    else:
+        weights  = np.linspace(0.5, 1.5, T)
+        weights /= weights.sum()
+        mean_prob = np.average(probs, axis=0, weights=weights)
+    pred_idx = int(np.argmax(mean_prob))
+    conf     = float(mean_prob[pred_idx])
+    return pred_idx, conf, mean_prob
 
-def viterbi_decode(posteriors, trans_mat, prior=None):
-    T_len, C = posteriors.shape
-    if prior is None:
-        prior = np.ones(C, dtype=np.float64) / C
-    log_A  = np.log(trans_mat  + 1e-12)
-    log_B  = np.log(np.clip(posteriors, 1e-12, 1.0))
-    log_pi = np.log(prior + 1e-12)
-    delta  = np.full((T_len, C), -np.inf)
-    psi    = np.zeros((T_len, C), dtype=int)
-    delta[0] = log_pi + log_B[0]
-    for t in range(1, T_len):
-        for c in range(C):
-            scores      = delta[t - 1] + log_A[:, c]
-            psi[t, c]   = int(np.argmax(scores))
-            delta[t, c] = scores[psi[t, c]] + log_B[t, c]
-    path = np.zeros(T_len, dtype=int)
-    path[-1] = int(np.argmax(delta[-1]))
-    for t in range(T_len - 2, -1, -1):
-        path[t] = psi[t + 1, path[t + 1]]
-    counts    = np.bincount(path, minlength=C)
-    pred_idx  = int(np.argmax(counts))
-    mean_prob = np.mean(posteriors, axis=0)
-    conf      = float(mean_prob[pred_idx])
-    return path, pred_idx, conf, mean_prob
 
 # ═══════════════════════════════════════════════════════════════
 # BALANCED FOLD ASSIGNMENT  (must happen before preprocessing)
@@ -958,8 +943,12 @@ for sid in sorted(set(allSID)):
     allF_n[all_mask] = (allF_sel[all_mask] - mu) / sd
 
 allF_n = np.clip(safe_array(allF_n), -10, 10)
+
+# Add delta features now that allF_n is z-scored (correct scale)
+print("Computing delta features on normalised data ...")
+allF_n     = add_delta_features(allF_n, allTK)
 N_FEATURES = allF_n.shape[1]
-print("Final feature dims:", N_FEATURES)
+print(f"Final feature dims (with deltas): {N_FEATURES}")
 
 # ═══════════════════════════════════════════════════════════════
 # PER-FOLD MI
@@ -1049,16 +1038,6 @@ final_clf = LinearDiscriminantAnalysis(solver='lsqr', shrinkage=FINAL_SH)
 final_clf.fit(trF_final[:, final_feature_idx], trY_final)
 print("Final model trained.")
 
-# Learn HMM transition matrix from training label sequences
-print("Learning HMM transition matrix from training sequences ...")
-_hmm_seqs = []
-for _tk in sorted(set(allTK[train_mask])):
-    _ix = np.where(allTK[train_mask] == _tk)[0]
-    _hmm_seqs.append(allY[train_mask][_ix])
-hmm_trans = learn_transition_matrix(_hmm_seqs)
-print("Transition matrix:")
-print(np.round(hmm_trans, 3))
-print("\nTraining sanity-check report:")
 print(classification_report(trY_final, final_clf.predict(trF_final[:, final_feature_idx]),
     target_names=[IDX_TO_LABEL[i] for i in range(NUM_CLASSES)], zero_division=0))
 
@@ -1079,7 +1058,7 @@ for tkey in sorted(set(teTK)):
             "pred_idx": int(preds[r]), "pred_label": IDX_TO_LABEL[int(preds[r])],
             "prob_NEUTRAL": float(probs[r,0]), "prob_ENTHUSIASM": float(probs[r,1]),
             "prob_SADNESS": float(probs[r,2]), "prob_FEAR": float(probs[r,3])})
-    _, pi, conf, mp = viterbi_decode(probs, hmm_trans)
+    pi, conf, mp = weighted_trial_vote(probs)
     trial_rows.append({"fold": TEST_FOLD, "trial_key": tkey, "n_windows": int(m.sum()),
         "true_idx": true_lbl, "true_label": IDX_TO_LABEL[true_lbl],
         "trial_pred_idx": pi, "trial_pred_label": IDX_TO_LABEL[pi],
@@ -1162,7 +1141,11 @@ for loso_sid in sorted(set(allSID)):
     trF_l = np.clip(safe_array(trF_l_n), -10, 10)
     teF_l = np.clip(safe_array(teF_l_n), -10, 10)
 
-    trY_l = allY[tr_m]; teY_l = allY[te_m]; teTK_l = allTK[te_m]
+    trTK_l = allTK[tr_m]
+    teTK_l = allTK[te_m]
+    trF_l  = add_delta_features(trF_l, trTK_l)
+    teF_l  = add_delta_features(teF_l, teTK_l)
+    trY_l = allY[tr_m]; teY_l = allY[te_m]
 
     sub_l = (np.random.RandomState(42).choice(len(trF_l), 2000, replace=False)
              if len(trF_l) > 2000 else np.arange(len(trF_l)))
@@ -1178,13 +1161,6 @@ for loso_sid in sorted(set(allSID)):
         print(f"  [LOSO] {loso_sid} failed: {ex}")
         continue
 
-    # Learn HMM transition matrix for this LOSO fold
-    _loso_hmm_seqs = []
-    for _tk in sorted(set(allTK[tr_m])):
-        _ix = np.where(allTK[tr_m] == _tk)[0]
-        _loso_hmm_seqs.append(allY[tr_m][_ix])
-    loso_hmm_trans = learn_transition_matrix(_loso_hmm_seqs)
-
     win_acc = float((preds_l == teY_l).mean())
     loso_accs.append((loso_sid, win_acc, int(te_m.sum())))
 
@@ -1197,7 +1173,7 @@ for loso_sid in sorted(set(allSID)):
                 "true_idx": tl, "true_label": IDX_TO_LABEL[tl],
                 "pred_idx": int(pd_[r]), "pred_label": IDX_TO_LABEL[int(pd_[r])],
             })
-        _, pi, conf, mp = viterbi_decode(pr, loso_hmm_trans)
+        pi, conf, mp = weighted_trial_vote(pr)
         loso_trial_rows.append({
             "subject": loso_sid, "trial_key": tkey, "n_windows": int(m.sum()),
             "true_idx": tl, "true_label": IDX_TO_LABEL[tl],
