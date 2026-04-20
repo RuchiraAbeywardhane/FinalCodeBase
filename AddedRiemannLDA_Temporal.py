@@ -65,7 +65,7 @@ TRAIN_BAND_STORED_SR = 256
 TRAIN_BVP_SR = 20
 
 WINDOW_SEC = 10
-OVERLAP_FRAC = 0.75
+OVERLAP_FRAC = 0.50  # reduced from 0.75 -- less correlated windows, less overfitting
 
 EEG_WIN  = WINDOW_SEC * EEG_SR
 BAND_WIN = WINDOW_SEC * BAND_SR
@@ -979,8 +979,8 @@ for fk in range(4):
     tr_idx_mi = np.where(tr_mask_mi)[0]
 
     sub = (
-        np.random.RandomState(42).choice(tr_idx_mi, 2000, replace=False)
-        if len(tr_idx_mi) > 2000 else tr_idx_mi
+        np.random.RandomState(42).choice(tr_idx_mi, 4000, replace=False)
+        if len(tr_idx_mi) > 4000 else tr_idx_mi
     )
 
     mi = mutual_info_classif(allF_n[sub], allY[sub], random_state=42, n_neighbors=5)
@@ -991,7 +991,7 @@ for fk in range(4):
 # ═══════════════════════════════════════════════════════════════
 print("\nSelecting final LDA hyperparameters ...")
 
-K_GRID = [40, 60, 80, 120, N_FEATURES]
+K_GRID = [40, 60, 80, 120, 160, 200, N_FEATURES]
 SH_GRID = ['auto', 0.05, 0.1, 0.3, 0.5, 0.7, 0.9]
 
 grid_scores = []
@@ -1046,8 +1046,8 @@ print(f"  Train windows : {len(trY_final)}")
 print(f"  Test  windows : {len(teY_final)}")
 
 sub_idx = (
-    np.random.RandomState(42).choice(len(trF_final), 2000, replace=False)
-    if len(trF_final) > 2000 else np.arange(len(trF_final))
+    np.random.RandomState(42).choice(len(trF_final), 4000, replace=False)
+    if len(trF_final) > 4000 else np.arange(len(trF_final))
 )
 mi_global         = mutual_info_classif(trF_final[sub_idx], trY_final[sub_idx], random_state=42, n_neighbors=5)
 final_feature_idx = np.argsort(-mi_global)[:FINAL_K]
@@ -1165,8 +1165,8 @@ for loso_sid in sorted(set(allSID)):
     teF_l  = add_temporal_features(teF_l, teTK_l)
     trY_l = allY[tr_m]; teY_l = allY[te_m]
 
-    sub_l = (np.random.RandomState(42).choice(len(trF_l), 2000, replace=False)
-             if len(trF_l) > 2000 else np.arange(len(trF_l)))
+    sub_l = (np.random.RandomState(42).choice(len(trF_l), 4000, replace=False)
+             if len(trF_l) > 4000 else np.arange(len(trF_l)))
     mi_l  = mutual_info_classif(trF_l[sub_l], trY_l[sub_l], random_state=42, n_neighbors=5)
     fi_l  = np.argsort(-mi_l)[:FINAL_K]
 
