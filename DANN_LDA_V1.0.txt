@@ -1,0 +1,698 @@
+
+# =================================================================
+# DANN_LDA.py
+# Domain Adversarial Neural Network (DANN) + LDA
+# -----------------------------------------------------------------
+# Pipeline:
+#   1. Extract 262 hand-crafted features  (same as Current.py)
+#   2. Euclidean Alignment per subject
+#   3. Per-subject z-score normalisation
+#   4. DANN feature extractor (GPU)
+#        - Emotion classifier head  (wants to predict emotion)
+#        - Subject adversarial head (wants to predict subject)
+#        - Feature extractor is trained to FOOL the subject head
+#          -> learns subject-invariant emotion features
+#   5. LDA on DANN bottleneck features
+#   6. LOSO evaluation
+# -----------------------------------------------------------------
+# Reference: Ganin et al. 2016  "Domain-Adversarial Training of
+#            Neural Networks"  JMLR 17(59):1-35
+# =================================================================
+
+import os, json, glob, time, warnings
+from collections import defaultdict, Counter
+
+import numpy as np
+import pandas as pd
+
+from scipy.signal import welch, coherence as sp_coherence, find_peaks, butter, filtfilt
+from scipy.stats import skew, kurtosis
+
+from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.feature_selection import VarianceThreshold, mutual_info_classif
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.autograd import Function
+
+warnings.filterwarnings("ignore")
+np.random.seed(42)
+torch.manual_seed(42)
+
+# -----------------------------------------------------------------
+# DEVICE
+# -----------------------------------------------------------------
+def _check_device():
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    try:
+        t = torch.zeros(4, device="cuda") + 1.0
+        _ = t.sum().item()
+        return torch.device("cuda")
+    except Exception as e:
+        print(f"[warn] CUDA failed ({e}) -- using CPU")
+        return torch.device("cpu")
+
+DEVICE = _check_device()
+print(f"Using device: {DEVICE}")
+if DEVICE.type == "cuda":
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+# =================================================================
+# PATHS + CONSTANTS  (identical to Current.py)
+# =================================================================
+EMOGNITION_ROOT = "/kaggle/input/datasets/ruchiabey/emognitioncleaned-combined"
+OUT_LOSO_TRIAL  = "/kaggle/working/dann_lda_loso_trial.csv"
+OUT_LOSO_WIN    = "/kaggle/working/dann_lda_loso_window.csv"
+
+EEG_SR           = 256
+BAND_SR          = 10
+TRAIN_BAND_STORED_SR = 256
+TRAIN_BVP_SR     = 20
+WINDOW_SEC       = 10
+OVERLAP_FRAC     = 0.75
+EEG_WIN          = WINDOW_SEC * EEG_SR
+BAND_WIN         = WINDOW_SEC * BAND_SR
+TRAIN_BVP_WIN    = int(WINDOW_SEC * TRAIN_BVP_SR)
+BASELINE_METHOD  = "zscore"
+BASELINE_EPS     = 1e-12
+NUM_CLASSES      = 4
+
+EMOTION_LABELS = {"NEUTRAL":0,"ENTHUSIASM":1,"SADNESS":2,"FEAR":3}
+IDX_TO_LABEL   = {v:k for k,v in EMOTION_LABELS.items()}
+EEG_CHANNELS   = ["RAW_TP9","RAW_AF7","RAW_AF8","RAW_TP10"]
+BAND_CHANNELS  = [
+    "Alpha_TP9","Alpha_AF7","Alpha_AF8","Alpha_TP10",
+    "Beta_TP9","Beta_AF7","Beta_AF8","Beta_TP10",
+    "Delta_TP9","Delta_AF7","Delta_AF8","Delta_TP10",
+    "Gamma_TP9","Gamma_AF7","Gamma_AF8","Gamma_TP10",
+    "Theta_TP9","Theta_AF7","Theta_AF8","Theta_TP10",
+]
+
+N_FEAT_EEG  = 156
+N_FEAT_MUSE = 62
+N_FEAT_BVP  = 7
+N_FEAT_HR   = 5
+N_FEAT_PPI  = 8
+N_FEAT_FAA  = 14
+N_FEAT_RIEM = 10
+N_FEATURES_RAW = (N_FEAT_EEG + N_FEAT_MUSE + N_FEAT_BVP +
+                  N_FEAT_HR  + N_FEAT_PPI  + N_FEAT_FAA + N_FEAT_RIEM)
+print(f"Raw feature count = {N_FEATURES_RAW}")
+
+# DANN hyperparameters
+DANN_BOTTLENECK = 64    # size of subject-invariant feature vector
+DANN_HIDDEN     = 256   # hidden layer size in all heads
+DANN_EPOCHS     = 100
+DANN_BATCH      = 64
+DANN_LR         = 1e-3
+DANN_PATIENCE   = 15
+DANN_LAMBDA_MAX = 1.0   # max adversarial weight (annealed from 0)
+
+# LDA on top of DANN
+DANN_LDA_SH = "auto"
+
+# =================================================================
+# ── ALL FEATURE EXTRACTION HELPERS (identical to Current.py) ──
+# =================================================================
+def safe_array(x):
+    return np.nan_to_num(np.asarray(x),nan=0.,posinf=0.,neginf=0.)
+
+def _interp_nan(a):
+    a=a.copy(); nans=np.isnan(a)
+    if not nans.any(): return a
+    idx=np.arange(len(a))
+    a[nans]=np.interp(idx[nans],idx[~nans],a[~nans])
+    return a
+
+def resample_1d_by_time(arr,orig_sr,target_sr):
+    arr=safe_array(np.asarray(arr,dtype=np.float32))
+    if len(arr)==0: return arr
+    old_t=np.arange(len(arr),dtype=np.float64)/float(orig_sr)
+    new_len=max(int(np.floor(len(arr)*float(target_sr)/float(orig_sr))),1)
+    new_t=np.arange(new_len,dtype=np.float64)/float(target_sr)
+    return np.interp(new_t,old_t,arr).astype(np.float32)
+
+def load_subject_baselines(data_root):
+    baselines={}
+    for subj in sorted(os.listdir(data_root)):
+        subj_dir=os.path.join(data_root,subj)
+        if not os.path.isdir(subj_dir) or not subj.isdigit(): continue
+        cands=sorted(glob.glob(os.path.join(subj_dir,"*_BASELINE_MUSE_cleaned.json")))
+        if not cands:
+            cands=[fp for fp in glob.glob(os.path.join(subj_dir,"*.json"))
+                   if "baseline" in fp.lower() and "muse" in fp.lower()]
+        if not cands: continue
+        try:
+            with open(cands[0]) as fh: raw=json.load(fh)
+            df=pd.DataFrame(raw["data"] if isinstance(raw,dict) and "data" in raw else raw)
+            cols=[c for c in EEG_CHANNELS if c in df.columns]
+            if not cols: continue
+            sig=np.stack([_interp_nan(df[c].to_numpy(dtype=np.float64)) for c in cols],axis=-1)
+            bm=sig.mean(0).astype(np.float32)
+            bs=np.where(sig.std(0)<1e-6,1.,sig.std(0)).astype(np.float32)
+            baselines[subj]=(bm,bs)
+        except: pass
+    print(f"[baselines] {len(baselines)} subjects")
+    return baselines
+
+def bandpass_bvp(sig,sr,low=0.7,high=3.5,order=2):
+    sig=np.asarray(sig,dtype=np.float64)
+    if len(sig)<max(10,order*3): return sig
+    nyq=0.5*sr; ln=max(low/nyq,1e-5); hn=min(high/nyq,0.999)
+    if ln>=hn: return sig
+    try:
+        b,a=butter(order,[ln,hn],btype="band")
+        return filtfilt(b,a,sig)
+    except: return sig
+
+def derive_hr_ppi_from_bvp(bvp,sr):
+    sig=safe_array(np.asarray(bvp,dtype=np.float64))
+    if len(sig)<8: return np.array([],dtype=np.float32),np.array([],dtype=np.float32)
+    sf=bandpass_bvp(sig,sr=sr); ss=np.std(sf)
+    sn=(sf-np.mean(sf))/ss if ss>1e-10 else sf-np.mean(sf)
+    try: peaks,_=find_peaks(sn,distance=max(1,int(0.35*sr)),prominence=0.2)
+    except: peaks=np.array([],dtype=int)
+    if len(peaks)<2: return np.array([],dtype=np.float32),np.array([],dtype=np.float32)
+    ibi=np.diff(peaks)/float(sr); ibi=ibi[(ibi>=0.35)&(ibi<=1.5)]
+    if len(ibi)==0: return np.array([],dtype=np.float32),np.array([],dtype=np.float32)
+    return (60./ibi).astype(np.float32),(ibi*1000.).astype(np.float32)
+
+FREQ_BANDS=[(1,4),(4,8),(8,13),(13,30),(30,100)]
+CH_PAIRS=[(0,1),(0,2),(0,3),(1,2),(1,3),(2,3)]
+
+def _compute_psd(sig,sr,nperseg=256):
+    return welch(sig,fs=sr,nperseg=min(nperseg,len(sig)))
+def _band_power(freqs,psd,lo,hi):
+    m=(freqs>=lo)&(freqs<hi); return np.mean(psd[m]) if m.any() else 1e-10
+def _hjorth(sig):
+    d1=np.diff(sig); d2=np.diff(d1); act=np.var(sig)
+    if act<1e-12: return 0.,0.,0.
+    mob=np.sqrt(np.var(d1)/act); vd1=np.var(d1)
+    if vd1<1e-12: return float(act),float(mob),0.
+    comp=np.sqrt(np.var(d2)/vd1)/mob if mob>1e-12 else 0.
+    return float(act),float(mob),float(comp)
+def _zcr(sig):
+    return float(np.sum(np.abs(np.diff(np.sign(sig)))>0))/max(len(sig)-1,1)
+def _de(sig):
+    v=np.var(sig); return 0.5*np.log(2*np.pi*np.e*v) if v>1e-12 else 0.
+def spectral_entropy(sig,sr=EEG_SR,nperseg=256):
+    _,psd=welch(sig,fs=sr,nperseg=min(nperseg,len(sig)))
+    pn=psd/(psd.sum()+1e-12); pn=pn[pn>0]
+    return float(-np.sum(pn*np.log2(pn))) if len(pn) else 0.
+def permutation_entropy(sig,order=3,delay=1):
+    n=len(sig)
+    if n<(order-1)*delay+1: return 0.
+    idx=np.arange(n-(order-1)*delay)
+    cols=np.column_stack([sig[idx+d*delay] for d in range(order)])
+    perms=np.argsort(cols,axis=1)
+    enc=np.zeros(perms.shape[0],dtype=np.int64)
+    for i in range(order): enc=enc*order+perms[:,i]
+    _,cnt=np.unique(enc,return_counts=True)
+    p=cnt.astype(np.float64)/cnt.sum()
+    return float(-np.sum(p*np.log2(p)))
+def wavelet_subband_energy(sig,wavelet="db4",level=5):
+    try:
+        import pywt
+        ml=pywt.dwt_max_level(len(sig),wavelet)
+        coeffs=pywt.wavedec(sig,wavelet,level=min(level,ml))
+        e=[float(np.mean(c**2)) for c in coeffs[:5]]
+        while len(e)<5: e.append(0.)
+        return e
+    except: return [0.]*5
+
+def extract_eeg_features(eeg_4ch,sr=EEG_SR):
+    feats=[]; bp=np.zeros((4,5),dtype=np.float64)
+    for ch in range(4):
+        sig=eeg_4ch[ch].astype(np.float64)
+        freqs,psd=_compute_psd(sig,sr)
+        for bi,(lo,hi) in enumerate(FREQ_BANDS):
+            pw=_band_power(freqs,psd,lo,hi); bp[ch,bi]=np.log1p(pw)
+        feats.extend(bp[ch].tolist())
+        for bi,(lo,hi) in enumerate(FREQ_BANDS):
+            pw=_band_power(freqs,psd,lo,hi)
+            feats.append(0.5*np.log(2*np.pi*np.e*pw) if pw>1e-12 else 0.)
+        feats.extend(_hjorth(sig))
+        feats.extend([float(np.mean(sig)),float(np.std(sig)),float(skew(sig)),float(kurtosis(sig))])
+        feats.append(_zcr(sig)); feats.append(_de(sig))
+        feats.append(spectral_entropy(sig,sr)); feats.append(permutation_entropy(sig))
+    for ch in range(4): feats.extend(wavelet_subband_energy(eeg_4ch[ch].astype(np.float64)))
+    for ch in range(4):
+        a,b,t=bp[ch,2],bp[ch,3],bp[ch,1]
+        feats.extend([a-b,a-t,t-b])
+    for bi in range(5): feats.append(bp[2,bi]-bp[1,bi])
+    for bi in range(5): feats.append(bp[3,bi]-bp[0,bi])
+    for (ci,cj) in CH_PAIRS:
+        try:
+            fc,coh=sp_coherence(eeg_4ch[ci].astype(np.float64),eeg_4ch[cj].astype(np.float64),
+                                fs=sr,nperseg=min(256,len(eeg_4ch[ci])))
+            for bi,(lo,hi) in enumerate(FREQ_BANDS):
+                m=(fc>=lo)&(fc<hi); feats.append(float(np.mean(coh[m])) if m.any() else 0.)
+        except: feats.extend([0.]*5)
+    return safe_array(np.array(feats,dtype=np.float32))
+
+def extract_band_features(bw):
+    feats=[]
+    for ch in range(20):
+        col=bw[ch]; col=col[np.isfinite(col)]
+        feats.extend([0.,0.] if len(col)==0 else [float(np.mean(col)),float(np.std(col))+1e-8])
+    def bp(bi,ei):
+        col=bw[bi*4+ei]; col=col[np.isfinite(col)]
+        return float(np.mean(col)) if len(col)>0 else 0.
+    for ei in range(4):
+        a,b,t=bp(0,ei),bp(1,ei),bp(4,ei)
+        db=b if abs(b)>1e-6 else 1e-6; dt=t if abs(t)>1e-6 else 1e-6
+        feats.extend([a/db,a/dt,t/db])
+    for bi in range(5): feats.append(bp(bi,2)-bp(bi,1))
+    for bi in range(5): feats.append(bp(bi,3)-bp(bi,0))
+    return safe_array(np.clip(np.array(feats,dtype=np.float32),-1e4,1e4))
+
+def extract_bvp_features(bw,sr):
+    sig=bw.astype(np.float64)
+    feats=[float(np.mean(sig)),float(np.std(sig)),float(skew(sig)),float(kurtosis(sig))]
+    fm=np.abs(np.fft.rfft(sig)); fr=np.fft.rfftfreq(len(sig),1./sr)
+    mhr=(fr>0.5)&(fr<4.)
+    feats.append(float(fr[mhr][np.argmax(fm[mhr])]) if mhr.any() and fm[mhr].max()>0 else 0.)
+    feats.append(_zcr(sig))
+    feats.append(float(np.sum(fr*fm)/fm.sum()) if len(fm)>1 and fm.sum()>0 else 0.)
+    return safe_array(np.array(feats,dtype=np.float32))
+
+def extract_hr_features(hr):
+    if len(hr)<2: return np.zeros(5,dtype=np.float32)
+    h=hr.astype(np.float64)
+    return safe_array(np.array([float(np.mean(h)),float(np.std(h)),
+                                 float(np.min(h)),float(np.max(h)),float(np.max(h)-np.min(h))],dtype=np.float32))
+
+def extract_ppi_features(ppi):
+    if len(ppi)<3: return np.zeros(8,dtype=np.float32)
+    ipi=ppi.astype(np.float64)
+    ipi_s=ipi/1000. if np.median(ipi)>10 else ipi.copy()
+    feats=[float(np.mean(ipi_s)),float(np.std(ipi_s))]
+    sd=np.diff(ipi_s)
+    feats.append(float(np.sqrt(np.mean(sd**2))) if len(sd)>0 else 0.)
+    feats.append(float(np.mean(np.abs(sd)>0.05)) if len(sd)>0 else 0.)
+    feats.append(float(np.std(sd)) if len(sd)>0 else 0.)
+    if len(ipi_s)>6:
+        tc=np.cumsum(ipi_s); tu=np.arange(tc[0],tc[-1],0.25)
+        if len(tu)>8:
+            iu=np.interp(tu,tc,ipi_s)
+            fi,pi=welch(iu,fs=4.,nperseg=min(len(iu),32))
+            lf=float(np.mean(pi[(fi>=0.04)&(fi<0.15)])) if ((fi>=0.04)&(fi<0.15)).any() else 0.
+            hf=float(np.mean(pi[(fi>=0.15)&(fi<0.4)])) if ((fi>=0.15)&(fi<0.4)).any() else 0.
+            feats.extend([lf,hf,lf/hf if hf>1e-10 else 0.])
+        else: feats.extend([0.,0.,0.])
+    else: feats.extend([0.,0.,0.])
+    return safe_array(np.array(feats,dtype=np.float32))
+
+def extract_faa_features(eeg_4ch,sr=EEG_SR):
+    feats=[]
+    ALPHA=(8,13);BETA=(13,30);THETA=(4,8);GAMMA=(30,45);DELTA=(1,4)
+    def _logbp(sig,lo,hi):
+        fr,ps=_compute_psd(sig,sr)
+        return float(np.log(_band_power(fr,ps,lo,hi)+1e-12))
+    feats.append(_logbp(eeg_4ch[2],*ALPHA)-_logbp(eeg_4ch[1],*ALPHA))
+    feats.append(_logbp(eeg_4ch[2],*BETA) -_logbp(eeg_4ch[1],*BETA))
+    feats.append(_logbp(eeg_4ch[2],*THETA)-_logbp(eeg_4ch[1],*THETA))
+    feats.append(_logbp(eeg_4ch[2],*GAMMA)-_logbp(eeg_4ch[1],*GAMMA))
+    for lo,hi in [ALPHA,BETA,THETA,GAMMA,DELTA]:
+        feats.append(_logbp(eeg_4ch[3],lo,hi)-_logbp(eeg_4ch[0],lo,hi))
+    a7=_logbp(eeg_4ch[1],*ALPHA);a8=_logbp(eeg_4ch[2],*ALPHA)
+    a9=_logbp(eeg_4ch[0],*ALPHA);a10=_logbp(eeg_4ch[3],*ALPHA)
+    feats.append((a8-a7)/(abs(a8+a7)+1e-8))
+    feats.append((a10-a9)/(abs(a10+a9)+1e-8))
+    b7=_logbp(eeg_4ch[1],*BETA);b8=_logbp(eeg_4ch[2],*BETA)
+    feats.append(a7/(a7+b7+1e-8)); feats.append(a8/(a8+b8+1e-8))
+    t7=_logbp(eeg_4ch[1],*THETA);t8=_logbp(eeg_4ch[2],*THETA)
+    feats.append(((t7+t8)/2)/((a7+a8)/2+1e-8))
+    return safe_array(np.array(feats,dtype=np.float32))
+
+def _sym_logm(M):
+    v,U=np.linalg.eigh(M)
+    return U@np.diag(np.log(np.maximum(v,1e-10)))@U.T
+def _reg_cov(X,reg=1e-4):
+    C,T=X.shape; Xc=X-X.mean(1,keepdims=True)
+    cov=(Xc@Xc.T)/(T-1)
+    return (1-reg)*cov+reg*(np.trace(cov)/C)*np.eye(C)
+def extract_riemannian_features(eeg_4ch):
+    cov=_reg_cov(eeg_4ch.astype(np.float64))
+    return safe_array(_sym_logm(cov)[np.triu_indices(4)].astype(np.float32))
+
+def _mat_sqrt_inv(M):
+    v,U=np.linalg.eigh(M)
+    return U@np.diag(1./np.sqrt(np.maximum(v,1e-10)))@U.T
+def euclidean_alignment(wins):
+    covs=[_reg_cov(w.astype(np.float64)) for w in wins]
+    R=np.stack(covs).mean(0); Ri=_mat_sqrt_inv(R)
+    return [Ri@w.astype(np.float64) for w in wins]
+
+def trial_vote_from_probs(probs):
+    mp=np.mean(probs,axis=0); pi=int(np.argmax(mp))
+    return pi,float(mp[pi]),mp
+
+# =================================================================
+# LOAD DATA  (identical logic to Current.py)
+# =================================================================
+print("\nLoading data ...")
+t0=time.time()
+subject_baselines=load_subject_baselines(EMOGNITION_ROOT)
+if subject_baselines:
+    global_baseline=(np.stack([v[0] for v in subject_baselines.values()]).mean(0),
+                     np.stack([v[1] for v in subject_baselines.values()]).mean(0))
+else:
+    global_baseline=None
+
+train_trials=[]; skipped=defaultdict(int)
+for subj in sorted(os.listdir(EMOGNITION_ROOT)):
+    subj_dir=os.path.join(EMOGNITION_ROOT,subj)
+    if not os.path.isdir(subj_dir) or not subj.isdigit(): continue
+    for eeg_json in sorted(glob.glob(os.path.join(subj_dir,"*_STIMULUS_MUSE_cleaned.json"))):
+        parts=os.path.basename(eeg_json).split("_")
+        emotion=parts[1].upper() if len(parts)>=2 else None
+        if emotion not in EMOTION_LABELS: skipped["bad_name"]+=1; continue
+        try:
+            with open(eeg_json) as f: ed=json.load(f)
+            eeg=safe_array(np.stack([np.array(ed[ch],dtype=np.float32) for ch in EEG_CHANNELS]))
+        except: skipped["bad_eeg"]+=1; continue
+        bl=subject_baselines.get(subj,global_baseline)
+        if bl is not None:
+            eeg=safe_array(((eeg.T-bl[0])/bl[1]).T.astype(np.float32))
+        T_eeg=eeg.shape[1]
+        muse_json=os.path.join(EMOGNITION_ROOT,subj,f"{subj}_{emotion}_STIMULUS_MUSE.json")
+        if not os.path.isfile(muse_json): skipped["no_muse"]+=1; continue
+        try:
+            with open(muse_json) as f: md=json.load(f)
+            bl2=[resample_1d_by_time(safe_array(np.array(md[bc],dtype=np.float32)),
+                                     TRAIN_BAND_STORED_SR,BAND_SR) for bc in BAND_CHANNELS]
+            ml=min(len(x) for x in bl2)
+            band_arr=np.stack([x[:ml] for x in bl2])
+        except: skipped["bad_muse"]+=1; continue
+        sw_json=os.path.join(EMOGNITION_ROOT,subj,f"{subj}_{emotion}_STIMULUS_SAMSUNG_WATCH.json")
+        if not os.path.isfile(sw_json): skipped["no_watch"]+=1; continue
+        try:
+            with open(sw_json) as f: sw=json.load(f)
+            if "BVPProcessed" not in sw: skipped["no_bvp"]+=1; continue
+            bvp_vals=safe_array(np.array([r[1] for r in sw["BVPProcessed"]],dtype=np.float32))
+        except: skipped["bad_watch"]+=1; continue
+        dur=min(T_eeg/EEG_SR,band_arr.shape[1]/BAND_SR,len(bvp_vals)/TRAIN_BVP_SR)
+        train_trials.append({"sid":subj,"emotion":emotion,
+            "label":EMOTION_LABELS[emotion],
+            "eeg":eeg[:,:int(dur*EEG_SR)],
+            "band":band_arr[:,:int(dur*BAND_SR)],
+            "bvp":bvp_vals[:int(dur*TRAIN_BVP_SR)],
+            "trial_key":f"{subj}_{emotion}"})
+print(f"Trials: {len(train_trials)} in {time.time()-t0:.1f}s  skipped={dict(skipped)}")
+
+# =================================================================
+# WINDOWING
+# =================================================================
+print("Windowing ...")
+step=WINDOW_SEC*(1-OVERLAP_FRAC)
+all_feat_w,all_labels_w,all_tkeys_w,all_sids_w,all_tidx_w=[],[],[],[],[]
+
+for ti,tr in enumerate(train_trials):
+    eeg=tr["eeg"]; band=tr["band"]; bvp=tr["bvp"]; tkey=tr["trial_key"]
+    dur=min(eeg.shape[1]/EEG_SR,band.shape[1]/BAND_SR,len(bvp)/TRAIN_BVP_SR)
+    for wi in range(int((dur-WINDOW_SEC)/step)+1):
+        ts=wi*step
+        es,ee=int(ts*EEG_SR),int(ts*EEG_SR)+EEG_WIN
+        ms,me=int(ts*BAND_SR),int(ts*BAND_SR)+BAND_WIN
+        bs,be=int(ts*TRAIN_BVP_SR),int(ts*TRAIN_BVP_SR)+TRAIN_BVP_WIN
+        if ee>eeg.shape[1] or me>band.shape[1] or be>len(bvp): break
+        ew=eeg[:,es:ee]; mw=band[:,ms:me]; bw=bvp[bs:be]
+        hr_win,ppi_win=derive_hr_ppi_from_bvp(bw,sr=TRAIN_BVP_SR)
+        feat=np.concatenate([
+            extract_eeg_features(ew), extract_band_features(mw),
+            extract_bvp_features(bw,TRAIN_BVP_SR), extract_hr_features(hr_win),
+            extract_ppi_features(ppi_win), extract_faa_features(ew),
+            extract_riemannian_features(ew)
+        ]).astype(np.float32)
+        all_feat_w.append(feat); all_labels_w.append(tr["label"])
+        all_tkeys_w.append(tkey); all_sids_w.append(tr["sid"]); all_tidx_w.append(ti)
+
+allF_raw=np.array(all_feat_w,dtype=np.float32)
+allY=np.array(all_labels_w); allTK=np.array(all_tkeys_w)
+allSID=np.array(all_sids_w); allTI=np.array(all_tidx_w)
+print(f"Windows: {len(allY)}")
+
+# =================================================================
+# EUCLIDEAN ALIGNMENT
+# =================================================================
+print("Euclidean Alignment ...")
+RIEM_START=N_FEAT_EEG+N_FEAT_MUSE+N_FEAT_BVP+N_FEAT_HR+N_FEAT_PPI+N_FEAT_FAA
+_sid_ew=defaultdict(list); _sid_gi=defaultdict(list)
+for ti,tr in enumerate(train_trials):
+    sid=tr["sid"]; eeg=tr["eeg"]; band=tr["band"]; bvp=tr["bvp"]
+    dur2=min(eeg.shape[1]/EEG_SR,band.shape[1]/BAND_SR,len(bvp)/TRAIN_BVP_SR)
+    for wi in range(int((dur2-WINDOW_SEC)/step)+1):
+        ts=wi*step
+        es,ee=int(ts*EEG_SR),int(ts*EEG_SR)+EEG_WIN
+        ms,me=int(ts*BAND_SR),int(ts*BAND_SR)+BAND_WIN
+        bs,be=int(ts*TRAIN_BVP_SR),int(ts*TRAIN_BVP_SR)+TRAIN_BVP_WIN
+        if ee>eeg.shape[1] or me>band.shape[1] or be>len(bvp): break
+        _sid_ew[sid].append(eeg[:,es:ee])
+for gi,sid in enumerate(allSID): _sid_gi[sid].append(gi)
+for sid in sorted(_sid_ew):
+    ews=_sid_ew[sid]; gis=_sid_gi[sid]
+    if len(ews)<2: continue
+    aligned=euclidean_alignment(ews)
+    for k,gi in enumerate(gis):
+        if k<len(aligned):
+            allF_raw[gi,RIEM_START:RIEM_START+N_FEAT_RIEM]=\
+                extract_riemannian_features(np.array(aligned[k],dtype=np.float32))
+print("EA done.")
+
+# =================================================================
+# GRADIENT REVERSAL LAYER
+# -----------------------------------------------------------------
+# Forward:  f(x) = x          (identity)
+# Backward: df/dx = -lambda   (flip gradient sign)
+# This forces the feature extractor to FOOL the subject classifier
+# =================================================================
+class GradReverse(Function):
+    @staticmethod
+    def forward(ctx,x,lam):
+        ctx.lam=lam; return x.view_as(x)
+    @staticmethod
+    def backward(ctx,grad):
+        return -ctx.lam*grad, None
+
+def grad_reverse(x,lam=1.0):
+    return GradReverse.apply(x,lam)
+
+# =================================================================
+# DANN ARCHITECTURE
+# -----------------------------------------------------------------
+#  Input (N_features)
+#      │
+#  FeatureExtractor  MLP with BatchNorm + Dropout
+#      │
+#  Bottleneck  (DANN_BOTTLENECK dims, subject-invariant)
+#     ╱ ╲
+# EmotionHead   SubjectHead (with GRL)
+#  4 classes    N_subjects classes
+# =================================================================
+class FeatureExtractor(nn.Module):
+    def __init__(self,in_dim,bottleneck=DANN_BOTTLENECK,hidden=DANN_HIDDEN):
+        super().__init__()
+        self.net=nn.Sequential(
+            nn.Linear(in_dim,hidden), nn.BatchNorm1d(hidden), nn.ELU(), nn.Dropout(0.4),
+            nn.Linear(hidden,hidden//2), nn.BatchNorm1d(hidden//2), nn.ELU(), nn.Dropout(0.3),
+            nn.Linear(hidden//2,bottleneck), nn.BatchNorm1d(bottleneck), nn.ELU(),
+        )
+    def forward(self,x): return self.net(x)
+
+class EmotionHead(nn.Module):
+    def __init__(self,bottleneck=DANN_BOTTLENECK,n_classes=NUM_CLASSES):
+        super().__init__()
+        self.net=nn.Sequential(
+            nn.Linear(bottleneck,32), nn.ELU(),
+            nn.Linear(32,n_classes)
+        )
+    def forward(self,x): return self.net(x)
+
+class SubjectHead(nn.Module):
+    def __init__(self,bottleneck=DANN_BOTTLENECK,n_subjects=41):
+        super().__init__()
+        self.net=nn.Sequential(
+            nn.Linear(bottleneck,64), nn.ELU(),
+            nn.Linear(64,n_subjects)
+        )
+    def forward(self,x,lam): return self.net(grad_reverse(x,lam))
+
+class DANN(nn.Module):
+    def __init__(self,in_dim,n_subjects):
+        super().__init__()
+        self.feat    = FeatureExtractor(in_dim)
+        self.emotion = EmotionHead()
+        self.subject = SubjectHead(n_subjects=n_subjects)
+    def forward(self,x,lam=1.0):
+        f  = self.feat(x)
+        ey = self.emotion(f)
+        sy = self.subject(f,lam)
+        return ey,sy,f
+
+# =================================================================
+# DATASET
+# =================================================================
+class WindowDataset(Dataset):
+    def __init__(self,F,Y,S):
+        self.F=torch.tensor(F,dtype=torch.float32)
+        self.Y=torch.tensor(Y,dtype=torch.long)
+        self.S=torch.tensor(S,dtype=torch.long)
+    def __len__(self): return len(self.Y)
+    def __getitem__(self,i): return self.F[i],self.Y[i],self.S[i]
+
+# =================================================================
+# LOSO TRAINING LOOP
+# =================================================================
+print("\n"+"="*60)
+print("DANN + LDA  --  LOSO EVALUATION")
+print("="*60)
+
+unique_sids=sorted(set(allSID))
+sid2idx={s:i for i,s in enumerate(unique_sids)}
+N_SUBJECTS=len(unique_sids)
+
+loso_win_rows=[]; loso_trial_rows=[]; loso_accs=[]
+
+for hold_sid in unique_sids:
+    te_m=(allSID==hold_sid); tr_m=~te_m
+    if te_m.sum()==0 or tr_m.sum()==0: continue
+
+    # ── 1. Preprocessing (fit on train only) ──────────────────
+    vt=VarianceThreshold(threshold=0.001)
+    vt.fit(allF_raw[tr_m])
+    trF=vt.transform(allF_raw[tr_m])
+    teF=vt.transform(allF_raw[te_m])
+    mu=trF.mean(0); sd=np.where(trF.std(0)<1e-8,1.,trF.std(0))
+    trF=np.clip((trF-mu)/sd,-10,10).astype(np.float32)
+    teF=np.clip((teF-mu)/sd,-10,10).astype(np.float32)
+
+    trY=allY[tr_m]; teY=allY[te_m]; teTK=allTK[te_m]
+    trSID_idx=np.array([sid2idx[s] for s in allSID[tr_m]])
+
+    in_dim=trF.shape[1]
+
+    # ── 2. Validation split (last 2 subjects from training) ───
+    tr_sids_here=sorted(set(allSID[tr_m]))
+    val_sids=set(tr_sids_here[-2:])
+    val_m_local=np.array([allSID[tr_m][i] in val_sids for i in range(tr_m.sum())])
+    trF_sub=trF[~val_m_local]; trY_sub=trY[~val_m_local]; trSID_sub=trSID_idx[~val_m_local]
+    vlF_sub=trF[val_m_local];  vlY_sub=trY[val_m_local]
+
+    # ── 3. Build DataLoaders ───────────────────────────────────
+    tr_loader=DataLoader(WindowDataset(trF_sub,trY_sub,trSID_sub),
+                         batch_size=DANN_BATCH,shuffle=True,num_workers=0)
+
+    # ── 4. DANN model + optimiser ─────────────────────────────
+    model=DANN(in_dim,N_SUBJECTS).to(DEVICE)
+    opt=torch.optim.Adam(model.parameters(),lr=DANN_LR,weight_decay=1e-4)
+    sched=torch.optim.lr_scheduler.CosineAnnealingLR(opt,T_max=DANN_EPOCHS)
+    emo_crit=nn.CrossEntropyLoss()
+    sub_crit=nn.CrossEntropyLoss()
+
+    best_vl=np.inf; best_state=None; pat=0
+
+    for ep in range(DANN_EPOCHS):
+        model.train()
+        # Anneal adversarial lambda 0->DANN_LAMBDA_MAX over training
+        p=ep/DANN_EPOCHS
+        lam=DANN_LAMBDA_MAX*(2./(1.+np.exp(-10.*p))-1.)
+
+        for xb,yb,sb in tr_loader:
+            xb,yb,sb=xb.to(DEVICE),yb.to(DEVICE),sb.to(DEVICE)
+            opt.zero_grad()
+            ey,sy,_=model(xb,lam)
+            loss=emo_crit(ey,yb)+lam*sub_crit(sy,sb)
+            loss.backward(); opt.step()
+        sched.step()
+
+        # Validation (emotion loss only -- no subject labels for val)
+        model.eval()
+        with torch.no_grad():
+            vx=torch.tensor(vlF_sub,dtype=torch.float32).to(DEVICE)
+            vy_pred,_,_=model(vx,0.)
+            vl_loss=emo_crit(vy_pred,torch.tensor(vlY_sub,dtype=torch.long).to(DEVICE)).item()
+
+        if vl_loss<best_vl:
+            best_vl=vl_loss
+            best_state={k:v.cpu().clone() for k,v in model.state_dict().items()}
+            pat=0
+        else:
+            pat+=1
+            if pat>=DANN_PATIENCE:
+                print(f"    [{hold_sid}] early stop ep={ep+1}")
+                break
+
+    model.load_state_dict({k:v.to(DEVICE) for k,v in best_state.items()})
+
+    # ── 5. Extract DANN bottleneck features ───────────────────
+    model.eval()
+    with torch.no_grad():
+        trF_dann=model.feat(torch.tensor(trF,dtype=torch.float32).to(DEVICE)).cpu().numpy()
+        teF_dann=model.feat(torch.tensor(teF,dtype=torch.float32).to(DEVICE)).cpu().numpy()
+
+    # ── 6. LDA on bottleneck features ─────────────────────────
+    try:
+        clf=LinearDiscriminantAnalysis(solver="lsqr",shrinkage=DANN_LDA_SH)
+        clf.fit(trF_dann,trY)
+        probs_te=clf.predict_proba(teF_dann)
+        preds_te=np.argmax(probs_te,axis=1)
+    except Exception as ex:
+        print(f"  [LDA] {hold_sid} failed: {ex}"); continue
+
+    win_acc=float((preds_te==teY).mean())
+    loso_accs.append((hold_sid,win_acc,int(te_m.sum())))
+
+    for tkey in sorted(set(teTK)):
+        m=(teTK==tkey); pr=probs_te[m]; tl=int(teY[m][0])
+        for r,p in enumerate(pr):
+            loso_win_rows.append({"subject":hold_sid,"trial_key":tkey,"window_idx":r,
+                "true_idx":tl,"true_label":IDX_TO_LABEL[tl],
+                "pred_idx":int(np.argmax(p)),"pred_label":IDX_TO_LABEL[int(np.argmax(p))]})
+        pi,conf,mp=trial_vote_from_probs(pr)
+        loso_trial_rows.append({"subject":hold_sid,"trial_key":tkey,"n_windows":int(m.sum()),
+            "true_idx":tl,"true_label":IDX_TO_LABEL[tl],
+            "trial_pred_idx":pi,"trial_pred_label":IDX_TO_LABEL[pi],
+            "trial_confidence":conf})
+    print(f"  {hold_sid}: win_acc={win_acc:.3f}  n_wins={int(te_m.sum())}")
+
+# =================================================================
+# SAVE + REPORT
+# =================================================================
+pd.DataFrame(loso_win_rows).to_csv(OUT_LOSO_WIN,index=False)
+pd.DataFrame(loso_trial_rows).to_csv(OUT_LOSO_TRIAL,index=False)
+
+loso_win_df=pd.DataFrame(loso_win_rows)
+loso_trial_df=pd.DataFrame(loso_trial_rows)
+
+if len(loso_win_df):
+    yt=loso_win_df["true_idx"].astype(int).values
+    yp=loso_win_df["pred_idx"].astype(int).values
+    print("\n"+"="*60)
+    print("DANN+LDA  LOSO -- WINDOW-LEVEL")
+    print("="*60)
+    print(f"Window accuracy: {(yt==yp).mean():.4f}")
+    print(classification_report(yt,yp,
+          target_names=[IDX_TO_LABEL[i] for i in range(NUM_CLASSES)],zero_division=0))
+    print(confusion_matrix(yt,yp,labels=list(range(NUM_CLASSES))))
+
+if len(loso_trial_df):
+    yt=loso_trial_df["true_idx"].astype(int).values
+    yp=loso_trial_df["trial_pred_idx"].astype(int).values
+    print("\n"+"="*60)
+    print("DANN+LDA  LOSO -- TRIAL-LEVEL")
+    print("="*60)
+    print(f"Trial accuracy: {(yt==yp).mean():.4f}")
+    print(classification_report(yt,yp,
+          target_names=[IDX_TO_LABEL[i] for i in range(NUM_CLASSES)],zero_division=0))
+    print(confusion_matrix(yt,yp,labels=list(range(NUM_CLASSES))))
+    print("\nPer-subject window accuracies:")
+    for sid,acc,n in loso_accs:
+        print(f"  {sid}: {acc:.3f}  ({n} wins)")
+    ml=float(np.mean([a for _,a,_ in loso_accs]))
+    sl=float(np.std([a for _,a,_ in loso_accs]))
+    print(f"\nMean LOSO window accuracy: {ml:.4f} +/- {sl:.4f}")

@@ -65,7 +65,7 @@ TRAIN_BAND_STORED_SR = 256
 TRAIN_BVP_SR = 20
 
 WINDOW_SEC = 10
-OVERLAP_FRAC = 0.50  # reduced from 0.75 -- less correlated windows, less overfitting
+OVERLAP_FRAC = 0.75
 
 EEG_WIN  = WINDOW_SEC * EEG_SR
 BAND_WIN = WINDOW_SEC * BAND_SR
@@ -103,25 +103,11 @@ N_FEAT_BVP  = 7
 N_FEAT_HR   = 5
 N_FEAT_PPI  = 8
 N_FEAT_FAA  = 14   # Frontal Alpha Asymmetry + hemispheric asymmetries
-N_FEAT_RIEM  = 10   # Riemannian tangent-space upper triangle of 4x4 log-cov
-N_FEAT_WPOS  = 1    # normalised window position within trial
-# NOTE: delta, delta-delta, cumulative mean, deviation are added
-# post-normalisation and do not count toward N_FEATURES_RAW
+N_FEAT_RIEM = 10   # Riemannian tangent-space upper triangle of 4x4 log-cov
 N_FEATURES_RAW = (N_FEAT_EEG + N_FEAT_MUSE + N_FEAT_BVP +
-                  N_FEAT_HR  + N_FEAT_PPI  + N_FEAT_FAA + N_FEAT_RIEM + N_FEAT_WPOS)
-print(f"Raw feature count = {N_FEATURES_RAW}")
+                  N_FEAT_HR  + N_FEAT_PPI  + N_FEAT_FAA + N_FEAT_RIEM)
 
-# ===============================================================
-# FEATURE ABLATION FLAGS
-# Toggle any modality off to test its contribution to accuracy.
-# Run with all True first (baseline), then flip each to False.
-# ===============================================================
-USE_BVP  = True   # 7  raw BVP features
-USE_HR   = True   # 5  HR features derived from BVP
-USE_PPI  = True   # 8  PPI/HRV features derived from BVP
-USE_MUSE = True   # 62 MUSE band power features
-USE_FAA  = True   # 14 frontal alpha asymmetry features
-USE_RIEM = True   # 10 Riemannian tangent-space features
+print(f"Raw feature count = {N_FEATURES_RAW}")
 
 # ???????????????????????????????????????????????????????????????
 # BASELINE REDUCTION HELPERS
@@ -799,18 +785,15 @@ for ti, tr in enumerate(train_trials):
         hr_win, ppi_win = derive_hr_ppi_from_bvp(bw, sr=TRAIN_BVP_SR)
 
         f_eeg  = extract_eeg_features(ew)
-        f_muse = extract_band_features(mw)              if USE_MUSE else np.zeros(N_FEAT_MUSE, dtype=np.float32)
-        f_bvp  = extract_bvp_features(bw, sr=TRAIN_BVP_SR) if USE_BVP  else np.zeros(N_FEAT_BVP,  dtype=np.float32)
-        f_hr   = extract_hr_features(hr_win)            if USE_HR   else np.zeros(N_FEAT_HR,   dtype=np.float32)
-        f_ppi  = extract_ppi_features(ppi_win)          if USE_PPI  else np.zeros(N_FEAT_PPI,  dtype=np.float32)
-        f_faa  = extract_faa_features(ew)               if USE_FAA  else np.zeros(N_FEAT_FAA,  dtype=np.float32)
-        f_riem = extract_riemannian_features(ew)        if USE_RIEM else np.zeros(N_FEAT_RIEM, dtype=np.float32)
-
-        # Normalised window position: 0.0=trial start, 1.0=trial end
-        win_pos_feat = np.array([float(wi) / float(max(n_wins - 1, 1))], dtype=np.float32)
+        f_muse = extract_band_features(mw)
+        f_bvp  = extract_bvp_features(bw, sr=TRAIN_BVP_SR)
+        f_hr   = extract_hr_features(hr_win)
+        f_ppi  = extract_ppi_features(ppi_win)
+        f_faa  = extract_faa_features(ew)          # 14 FAA features
+        f_riem = extract_riemannian_features(ew)   # 10 Riemannian (pre-EA)
 
         feat = np.concatenate(
-            [f_eeg, f_muse, f_bvp, f_hr, f_ppi, f_faa, f_riem, win_pos_feat]
+            [f_eeg, f_muse, f_bvp, f_hr, f_ppi, f_faa, f_riem]
         ).astype(np.float32)
 
         all_feat_w.append(feat)
@@ -843,9 +826,7 @@ for ti, tr in enumerate(train_trials):
     step2 = WINDOW_SEC * (1 - OVERLAP_FRAC)
     for wi in range(int((dur2 - WINDOW_SEC) / step2) + 1):
         e_s = int(wi * step2 * EEG_SR); e_e = e_s + EEG_WIN
-        m_s = int(wi * step2 * BAND_SR); m_e = m_s + BAND_WIN
-        b_s = int(wi * step2 * TRAIN_BVP_SR); b_e = b_s + TRAIN_BVP_WIN
-        if e_e > eeg.shape[1] or m_e > band.shape[1] or b_e > len(bvp): break
+        if e_e > eeg.shape[1]: break
         _sid_to_ew[sid].append(eeg[:, e_s:e_e])
 
 for gidx, sid in enumerate(allSID):
@@ -861,52 +842,6 @@ for sid in sorted(_sid_to_ew.keys()):
                 extract_riemannian_features(np.array(aligned[k], dtype=np.float32))
 
 print("EA done -- Riemannian features updated with subject-aligned covariances.")
-
-# ================================================================
-# TEMPORAL FEATURES  (all computed on z-scored features)
-#   1. Delta         -- f_t - f_{t-1}          (rate of change)
-#   2. Delta-delta   -- delta_t - delta_{t-1}  (acceleration)
-#   3. Cumulative mean -- mean(f_0..f_t)        (trend so far)
-#   4. Deviation     -- f_t - cumulative_mean_t (peak detection)
-# ================================================================
-def add_temporal_features(F_n, trial_keys):
-    # Only delta and delta-delta -- these capture relative changes
-    # which generalise across subjects.
-    # Cumulative mean and deviation were removed -- they memorise
-    # each trial's own trajectory and cause severe overfitting on LOSO.
-    delta  = np.zeros_like(F_n)
-    delta2 = np.zeros_like(F_n)
-
-    for tkey in sorted(set(trial_keys)):
-        idx = np.where(trial_keys == tkey)[0]
-        for i in range(1, len(idx)):
-            delta[idx[i]] = F_n[idx[i]] - F_n[idx[i - 1]]
-        for i in range(2, len(idx)):
-            delta2[idx[i]] = delta[idx[i]] - delta[idx[i - 1]]
-
-    return np.concatenate([F_n, delta, delta2], axis=1)
-
-# keep old name as alias so LOSO block still works if referenced
-add_delta_features = add_temporal_features
-
-# ================================================================
-# WEIGHTED TRIAL VOTE  (exponential ramp)
-# Later windows carry exponentially more weight -- the emotion
-# response is strongest toward the end of the video stimulus.
-# e^0=1.0 (first window) ... e^2=7.4 (last window)
-# ================================================================
-def weighted_trial_vote(probs, num_classes=NUM_CLASSES):
-    T = len(probs)
-    if T == 1:
-        mean_prob = probs[0].astype(np.float64)
-    else:
-        weights  = np.exp(np.linspace(0.0, 1.0, T))  # e^0=1x ... e^1=2.7x (softer ramp)
-        weights /= weights.sum()
-        mean_prob = np.average(probs, axis=0, weights=weights)
-    pred_idx = int(np.argmax(mean_prob))
-    conf     = float(mean_prob[pred_idx])
-    return pred_idx, np.float64(conf), mean_prob
-
 
 # ═══════════════════════════════════════════════════════════════
 # BALANCED FOLD ASSIGNMENT  (must happen before preprocessing)
@@ -973,12 +908,8 @@ for sid in sorted(set(allSID)):
     allF_n[all_mask] = (allF_sel[all_mask] - mu) / sd
 
 allF_n = np.clip(safe_array(allF_n), -10, 10)
-
-# Add temporal features now that allF_n is z-scored (correct scale)
-print("Computing temporal features on normalised data ...")
-allF_n     = add_temporal_features(allF_n, allTK)
 N_FEATURES = allF_n.shape[1]
-print(f"Final feature dims (with temporal features): {N_FEATURES}")
+print("Final feature dims:", N_FEATURES)
 
 # ═══════════════════════════════════════════════════════════════
 # PER-FOLD MI
@@ -991,8 +922,8 @@ for fk in range(4):
     tr_idx_mi = np.where(tr_mask_mi)[0]
 
     sub = (
-        np.random.RandomState(42).choice(tr_idx_mi, 4000, replace=False)
-        if len(tr_idx_mi) > 4000 else tr_idx_mi
+        np.random.RandomState(42).choice(tr_idx_mi, 2000, replace=False)
+        if len(tr_idx_mi) > 2000 else tr_idx_mi
     )
 
     mi = mutual_info_classif(allF_n[sub], allY[sub], random_state=42, n_neighbors=5)
@@ -1003,7 +934,7 @@ for fk in range(4):
 # ═══════════════════════════════════════════════════════════════
 print("\nSelecting final LDA hyperparameters ...")
 
-K_GRID = [40, 60, 80, 120, 160, 200, N_FEATURES]
+K_GRID = [80, 120, N_FEATURES]
 SH_GRID = ['auto', 0.05, 0.1, 0.3, 0.5, 0.7, 0.9]
 
 grid_scores = []
@@ -1058,8 +989,8 @@ print(f"  Train windows : {len(trY_final)}")
 print(f"  Test  windows : {len(teY_final)}")
 
 sub_idx = (
-    np.random.RandomState(42).choice(len(trF_final), 4000, replace=False)
-    if len(trF_final) > 4000 else np.arange(len(trF_final))
+    np.random.RandomState(42).choice(len(trF_final), 2000, replace=False)
+    if len(trF_final) > 2000 else np.arange(len(trF_final))
 )
 mi_global         = mutual_info_classif(trF_final[sub_idx], trY_final[sub_idx], random_state=42, n_neighbors=5)
 final_feature_idx = np.argsort(-mi_global)[:FINAL_K]
@@ -1067,7 +998,7 @@ final_feature_idx = np.argsort(-mi_global)[:FINAL_K]
 final_clf = LinearDiscriminantAnalysis(solver='lsqr', shrinkage=FINAL_SH)
 final_clf.fit(trF_final[:, final_feature_idx], trY_final)
 print("Final model trained.")
-
+print("\nTraining sanity-check report:")
 print(classification_report(trY_final, final_clf.predict(trF_final[:, final_feature_idx]),
     target_names=[IDX_TO_LABEL[i] for i in range(NUM_CLASSES)], zero_division=0))
 
@@ -1088,7 +1019,7 @@ for tkey in sorted(set(teTK)):
             "pred_idx": int(preds[r]), "pred_label": IDX_TO_LABEL[int(preds[r])],
             "prob_NEUTRAL": float(probs[r,0]), "prob_ENTHUSIASM": float(probs[r,1]),
             "prob_SADNESS": float(probs[r,2]), "prob_FEAR": float(probs[r,3])})
-    pi, conf, mp = weighted_trial_vote(probs)
+    pi, conf, mp = trial_vote_from_probs(probs)
     trial_rows.append({"fold": TEST_FOLD, "trial_key": tkey, "n_windows": int(m.sum()),
         "true_idx": true_lbl, "true_label": IDX_TO_LABEL[true_lbl],
         "trial_pred_idx": pi, "trial_pred_label": IDX_TO_LABEL[pi],
@@ -1154,31 +1085,15 @@ for loso_sid in sorted(set(allSID)):
     trF_l = vt_l.transform(allF_raw[tr_m])
     teF_l = vt_l.transform(allF_raw[te_m])
 
-    # Per-subject z-score: fit stats on each training subject's windows only
-    trSID_l = allSID[tr_m]
-    teSID_l = allSID[te_m]
-    trF_l_n = np.empty_like(trF_l)
-    teF_l_n = np.empty_like(teF_l)
-    for _sid in sorted(set(trSID_l)):
-        _sm = (trSID_l == _sid)
-        _mu = trF_l[_sm].mean(axis=0)
-        _sd = np.where(trF_l[_sm].std(axis=0) < 1e-8, 1.0, trF_l[_sm].std(axis=0))
-        trF_l_n[_sm] = (trF_l[_sm] - _mu) / _sd
-    # test subject: use mean of all training subjects' stats (unseen subject)
-    _mu_global = trF_l.mean(axis=0)
-    _sd_global = np.where(trF_l.std(axis=0) < 1e-8, 1.0, trF_l.std(axis=0))
-    teF_l_n[:] = (teF_l - _mu_global) / _sd_global
-    trF_l = np.clip(safe_array(trF_l_n), -10, 10)
-    teF_l = np.clip(safe_array(teF_l_n), -10, 10)
+    mu_l = trF_l.mean(axis=0)
+    sd_l = np.where(trF_l.std(axis=0) < 1e-8, 1.0, trF_l.std(axis=0))
+    trF_l = np.clip((trF_l - mu_l) / sd_l, -10, 10)
+    teF_l = np.clip((teF_l - mu_l) / sd_l, -10, 10)
 
-    trTK_l = allTK[tr_m]
-    teTK_l = allTK[te_m]
-    trF_l  = add_temporal_features(trF_l, trTK_l)
-    teF_l  = add_temporal_features(teF_l, teTK_l)
-    trY_l = allY[tr_m]; teY_l = allY[te_m]
+    trY_l = allY[tr_m]; teY_l = allY[te_m]; teTK_l = allTK[te_m]
 
-    sub_l = (np.random.RandomState(42).choice(len(trF_l), 4000, replace=False)
-             if len(trF_l) > 4000 else np.arange(len(trF_l)))
+    sub_l = (np.random.RandomState(42).choice(len(trF_l), 2000, replace=False)
+             if len(trF_l) > 2000 else np.arange(len(trF_l)))
     mi_l  = mutual_info_classif(trF_l[sub_l], trY_l[sub_l], random_state=42, n_neighbors=5)
     fi_l  = np.argsort(-mi_l)[:FINAL_K]
 
@@ -1203,7 +1118,7 @@ for loso_sid in sorted(set(allSID)):
                 "true_idx": tl, "true_label": IDX_TO_LABEL[tl],
                 "pred_idx": int(pd_[r]), "pred_label": IDX_TO_LABEL[int(pd_[r])],
             })
-        pi, conf, mp = weighted_trial_vote(pr)
+        pi, conf, mp = trial_vote_from_probs(pr)
         loso_trial_rows.append({
             "subject": loso_sid, "trial_key": tkey, "n_windows": int(m.sum()),
             "true_idx": tl, "true_label": IDX_TO_LABEL[tl],
