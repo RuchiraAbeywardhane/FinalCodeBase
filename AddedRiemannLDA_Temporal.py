@@ -105,6 +105,8 @@ N_FEAT_PPI  = 8
 N_FEAT_FAA  = 14   # Frontal Alpha Asymmetry + hemispheric asymmetries
 N_FEAT_RIEM  = 10   # Riemannian tangent-space upper triangle of 4x4 log-cov
 N_FEAT_WPOS  = 1    # normalised window position within trial
+# NOTE: delta, delta-delta, cumulative mean, deviation are added
+# post-normalisation and do not count toward N_FEATURES_RAW
 N_FEATURES_RAW = (N_FEAT_EEG + N_FEAT_MUSE + N_FEAT_BVP +
                   N_FEAT_HR  + N_FEAT_PPI  + N_FEAT_FAA + N_FEAT_RIEM + N_FEAT_WPOS)
 print(f"Raw feature count = {N_FEATURES_RAW}")
@@ -849,33 +851,56 @@ for sid in sorted(_sid_to_ew.keys()):
 print("EA done -- Riemannian features updated with subject-aligned covariances.")
 
 # ================================================================
-# DELTA FEATURES  (first-order diff on z-scored features per trial)
-# Computed AFTER normalisation so all features are on same scale.
+# TEMPORAL FEATURES  (all computed on z-scored features)
+#   1. Delta         -- f_t - f_{t-1}          (rate of change)
+#   2. Delta-delta   -- delta_t - delta_{t-1}  (acceleration)
+#   3. Cumulative mean -- mean(f_0..f_t)        (trend so far)
+#   4. Deviation     -- f_t - cumulative_mean_t (peak detection)
 # ================================================================
-def add_delta_features(F_n, trial_keys):
-    delta = np.zeros_like(F_n)
+def add_temporal_features(F_n, trial_keys):
+    N, D = F_n.shape
+    delta     = np.zeros_like(F_n)
+    delta2    = np.zeros_like(F_n)
+    cum_mean  = np.zeros_like(F_n)
+    deviation = np.zeros_like(F_n)
+
     for tkey in sorted(set(trial_keys)):
         idx = np.where(trial_keys == tkey)[0]
+        # delta
         for i in range(1, len(idx)):
             delta[idx[i]] = F_n[idx[i]] - F_n[idx[i - 1]]
-    return np.concatenate([F_n, delta], axis=1)
+        # delta-delta
+        for i in range(2, len(idx)):
+            delta2[idx[i]] = delta[idx[i]] - delta[idx[i - 1]]
+        # cumulative mean and deviation
+        running = np.zeros(D, dtype=np.float64)
+        for k, gi in enumerate(idx):
+            running += F_n[gi]
+            cum_mean[gi]  = running / (k + 1)
+            deviation[gi] = F_n[gi] - cum_mean[gi]
+
+    return np.concatenate([F_n, delta, delta2, cum_mean, deviation], axis=1)
+
+# keep old name as alias so LOSO block still works if referenced
+add_delta_features = add_temporal_features
 
 # ================================================================
-# WEIGHTED TRIAL VOTE
-# Later windows carry more weight -- emotion builds across the trial
-# weight ramp: 0.5 (first window) -> 1.5 (last window)
+# WEIGHTED TRIAL VOTE  (exponential ramp)
+# Later windows carry exponentially more weight -- the emotion
+# response is strongest toward the end of the video stimulus.
+# e^0=1.0 (first window) ... e^2=7.4 (last window)
 # ================================================================
 def weighted_trial_vote(probs, num_classes=NUM_CLASSES):
     T = len(probs)
     if T == 1:
-        mean_prob = probs[0]
+        mean_prob = probs[0].astype(np.float64)
     else:
-        weights  = np.linspace(0.5, 1.5, T)
+        weights  = np.exp(np.linspace(0.0, 2.0, T))
         weights /= weights.sum()
         mean_prob = np.average(probs, axis=0, weights=weights)
     pred_idx = int(np.argmax(mean_prob))
     conf     = float(mean_prob[pred_idx])
-    return pred_idx, conf, mean_prob
+    return pred_idx, np.float64(conf), mean_prob
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -944,11 +969,11 @@ for sid in sorted(set(allSID)):
 
 allF_n = np.clip(safe_array(allF_n), -10, 10)
 
-# Add delta features now that allF_n is z-scored (correct scale)
-print("Computing delta features on normalised data ...")
-allF_n     = add_delta_features(allF_n, allTK)
+# Add temporal features now that allF_n is z-scored (correct scale)
+print("Computing temporal features on normalised data ...")
+allF_n     = add_temporal_features(allF_n, allTK)
 N_FEATURES = allF_n.shape[1]
-print(f"Final feature dims (with deltas): {N_FEATURES}")
+print(f"Final feature dims (with temporal features): {N_FEATURES}")
 
 # ═══════════════════════════════════════════════════════════════
 # PER-FOLD MI
@@ -1143,8 +1168,8 @@ for loso_sid in sorted(set(allSID)):
 
     trTK_l = allTK[tr_m]
     teTK_l = allTK[te_m]
-    trF_l  = add_delta_features(trF_l, trTK_l)
-    teF_l  = add_delta_features(teF_l, teTK_l)
+    trF_l  = add_temporal_features(trF_l, trTK_l)
+    teF_l  = add_temporal_features(teF_l, teTK_l)
     trY_l = allY[tr_m]; teY_l = allY[te_m]
 
     sub_l = (np.random.RandomState(42).choice(len(trF_l), 2000, replace=False)
