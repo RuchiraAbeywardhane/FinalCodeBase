@@ -858,28 +858,21 @@ print("EA done -- Riemannian features updated with subject-aligned covariances."
 #   4. Deviation     -- f_t - cumulative_mean_t (peak detection)
 # ================================================================
 def add_temporal_features(F_n, trial_keys):
-    N, D = F_n.shape
-    delta     = np.zeros_like(F_n)
-    delta2    = np.zeros_like(F_n)
-    cum_mean  = np.zeros_like(F_n)
-    deviation = np.zeros_like(F_n)
+    # Only delta and delta-delta -- these capture relative changes
+    # which generalise across subjects.
+    # Cumulative mean and deviation were removed -- they memorise
+    # each trial's own trajectory and cause severe overfitting on LOSO.
+    delta  = np.zeros_like(F_n)
+    delta2 = np.zeros_like(F_n)
 
     for tkey in sorted(set(trial_keys)):
         idx = np.where(trial_keys == tkey)[0]
-        # delta
         for i in range(1, len(idx)):
             delta[idx[i]] = F_n[idx[i]] - F_n[idx[i - 1]]
-        # delta-delta
         for i in range(2, len(idx)):
             delta2[idx[i]] = delta[idx[i]] - delta[idx[i - 1]]
-        # cumulative mean and deviation
-        running = np.zeros(D, dtype=np.float64)
-        for k, gi in enumerate(idx):
-            running += F_n[gi]
-            cum_mean[gi]  = running / (k + 1)
-            deviation[gi] = F_n[gi] - cum_mean[gi]
 
-    return np.concatenate([F_n, delta, delta2, cum_mean, deviation], axis=1)
+    return np.concatenate([F_n, delta, delta2], axis=1)
 
 # keep old name as alias so LOSO block still works if referenced
 add_delta_features = add_temporal_features
@@ -895,7 +888,7 @@ def weighted_trial_vote(probs, num_classes=NUM_CLASSES):
     if T == 1:
         mean_prob = probs[0].astype(np.float64)
     else:
-        weights  = np.exp(np.linspace(0.0, 2.0, T))
+        weights  = np.exp(np.linspace(0.0, 1.0, T))  # e^0=1x ... e^1=2.7x (softer ramp)
         weights /= weights.sum()
         mean_prob = np.average(probs, axis=0, weights=weights)
     pred_idx = int(np.argmax(mean_prob))
@@ -998,7 +991,7 @@ for fk in range(4):
 # ═══════════════════════════════════════════════════════════════
 print("\nSelecting final LDA hyperparameters ...")
 
-K_GRID = [80, 120, N_FEATURES]
+K_GRID = [40, 60, 80, 120, N_FEATURES]
 SH_GRID = ['auto', 0.05, 0.1, 0.3, 0.5, 0.7, 0.9]
 
 grid_scores = []
