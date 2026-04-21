@@ -106,14 +106,17 @@ print(f"Raw feature count = {N_FEATURES_RAW}")
 # DANN hyperparameters
 DANN_BOTTLENECK = 64    # size of subject-invariant feature vector
 DANN_HIDDEN     = 256   # hidden layer size in all heads
-DANN_EPOCHS     = 100
+DANN_EPOCHS     = 150
 DANN_BATCH      = 64
-DANN_LR         = 1e-3
-DANN_PATIENCE   = 15
-DANN_LAMBDA_MAX = 1.0   # max adversarial weight (annealed from 0)
+DANN_LR         = 5e-4
+DANN_PATIENCE   = 25
+DANN_MIN_EPOCHS = 50    # no early stopping before this epoch
+DANN_EMA_ALPHA  = 0.2   # smoothing for val loss (lower = smoother)
+DANN_LAMBDA_MAX = 0.2   # max adversarial weight (annealed from 0)
 
 # LDA on top of DANN
 DANN_LDA_SH = "auto"
+MI_TOP_K = 80   # keep top-K features ranked by MI; set to None to disable
 
 # =================================================================
 # ── ALL FEATURE EXTRACTION HELPERS (identical to Current.py) ──
@@ -572,6 +575,12 @@ for hold_sid in unique_sids:
     trF=np.clip((trF-mu)/sd,-10,10).astype(np.float32)
     teF=np.clip((teF-mu)/sd,-10,10).astype(np.float32)
 
+    # -- 1b. MI feature selection (fitted on train only) --
+    if MI_TOP_K is not None and MI_TOP_K < trF.shape[1]:
+        mi_scores = mutual_info_classif(trF, allY[tr_m], random_state=42)
+        mi_cols   = np.argsort(mi_scores)[::-1][:MI_TOP_K]
+        trF = trF[:, mi_cols]; teF = teF[:, mi_cols]
+
     trY=allY[tr_m]; teY=allY[te_m]; teTK=allTK[te_m]
     trSID_idx=np.array([sid2idx[s] for s in allSID[tr_m]])
 
@@ -579,7 +588,7 @@ for hold_sid in unique_sids:
 
     # ── 2. Validation split (last 2 subjects from training) ───
     tr_sids_here=sorted(set(allSID[tr_m]))
-    val_sids=set(tr_sids_here[-2:])
+    val_sids=set(tr_sids_here[-3:])
     val_m_local=np.array([allSID[tr_m][i] in val_sids for i in range(tr_m.sum())])
     trF_sub=trF[~val_m_local]; trY_sub=trY[~val_m_local]; trSID_sub=trSID_idx[~val_m_local]
     vlF_sub=trF[val_m_local];  vlY_sub=trY[val_m_local]
@@ -595,7 +604,7 @@ for hold_sid in unique_sids:
     emo_crit=nn.CrossEntropyLoss()
     sub_crit=nn.CrossEntropyLoss()
 
-    best_vl=np.inf; best_state=None; pat=0
+    best_vl=np.inf; best_state=None; pat=0; ema_vl=None
 
     for ep in range(DANN_EPOCHS):
         model.train()
@@ -618,15 +627,19 @@ for hold_sid in unique_sids:
             vy_pred,_,_=model(vx,0.)
             vl_loss=emo_crit(vy_pred,torch.tensor(vlY_sub,dtype=torch.long).to(DEVICE)).item()
 
-        if vl_loss<best_vl:
-            best_vl=vl_loss
+        # EMA-smooth the val loss to reduce noise
+        ema_vl = vl_loss if ema_vl is None else DANN_EMA_ALPHA*vl_loss + (1-DANN_EMA_ALPHA)*ema_vl
+        if ema_vl<best_vl:
+            best_vl=ema_vl
             best_state={k:v.cpu().clone() for k,v in model.state_dict().items()}
             pat=0
         else:
-            pat+=1
-            if pat>=DANN_PATIENCE:
-                print(f"    [{hold_sid}] early stop ep={ep+1}")
-                break
+            # only start counting patience after min epochs
+            if ep >= DANN_MIN_EPOCHS:
+                pat+=1
+                if pat>=DANN_PATIENCE:
+                    print(f"    [{hold_sid}] early stop ep={ep+1}")
+                    break
 
     model.load_state_dict({k:v.to(DEVICE) for k,v in best_state.items()})
 

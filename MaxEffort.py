@@ -24,25 +24,6 @@ from scipy.stats import skew, kurtosis
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.feature_selection import VarianceThreshold, mutual_info_classif
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from sklearn.svm import SVC
-
-from sklearn.svm import LinearSVC
-from sklearn.calibration import CalibratedClassifierCV
-
-def make_linear_svm(C=1.0):
-    base = LinearSVC(C=C, class_weight='balanced', max_iter=2000,
-                     random_state=42, dual=True)
-    return CalibratedClassifierCV(base, cv=3, method='isotonic')
-
-
-from sklearn.svm import LinearSVC
-from sklearn.calibration import CalibratedClassifierCV
-
-def make_linear_svm(C=1.0):
-    base = LinearSVC(C=C, class_weight='balanced', max_iter=2000,
-                     random_state=42, dual=True)
-    return CalibratedClassifierCV(base, cv=3, method='isotonic')
-
 
 try:
     from pyriemann.estimation import Covariances as _PyrCov
@@ -281,10 +262,19 @@ def parse_true_label_from_infer_trial_key(trial_key):
         return "FEAR"
     return None
 
-def trial_vote_from_probs(probs, num_classes=NUM_CLASSES):
-    mean_prob = np.mean(probs, axis=0)
-    pred_idx = int(np.argmax(mean_prob))
-    conf = float(mean_prob[pred_idx])
+def trial_vote_from_probs(probs, num_classes=NUM_CLASSES, conf_threshold=0.0):
+    # Confidence-weighted soft voting.
+    # Each window weighted by its peak softmax prob.
+    # Windows below conf_threshold get zero weight.
+    probs = np.asarray(probs, dtype=np.float64)
+    win_conf = probs.max(axis=1)
+    weights  = np.where(win_conf >= conf_threshold, win_conf, 0.0)
+    if weights.sum() < 1e-10:
+        weights = np.ones(len(probs))
+    weights   = weights / weights.sum()
+    mean_prob = (probs * weights[:, None]).sum(axis=0)
+    pred_idx  = int(np.argmax(mean_prob))
+    conf      = float(mean_prob[pred_idx])
     return pred_idx, conf, mean_prob
 
 # ═══════════════════════════════════════════════════════════════
@@ -629,43 +619,32 @@ def _matrix_sqrt_inv(M):
     v, U = np.linalg.eigh(M)
     return U @ np.diag(1.0/np.sqrt(np.maximum(v, 1e-10))) @ U.T
 
-
-# ===============================================================
-# CORAL -- CORrelation ALignment  (Sun & Saenko 2016)
-# Aligns the covariance of source (train) features to match the
-# target (test subject) feature covariance.
-# Steps:
-#   1. Whiten source:   X_src @ C_src^{-1/2}
-#   2. Re-colour:       result  @ C_tgt^{+1/2}
-# No labels needed -- purely unsupervised.
-# ===============================================================
-def coral_align(X_src, X_tgt, reg=1e-6):
-    """
-    X_src : (N_train, F)  z-scored training features
-    X_tgt : (N_test,  F)  z-scored test features
-    Returns X_src_aligned with same shape as X_src.
-    X_tgt is unchanged -- it is already the target distribution.
-    """
-    from scipy.linalg import sqrtm
-    X_src = np.array(X_src, dtype=np.float64)
-    X_tgt = np.array(X_tgt, dtype=np.float64)
-    F = X_src.shape[1]
-
-    C_src = np.cov(X_src.T) + reg * np.eye(F)
-    C_tgt = np.cov(X_tgt.T) + reg * np.eye(F)
-
-    # matrix square roots -- sqrtm can return complex due to numerics, take real part
-    A_src = np.real(sqrtm(np.linalg.inv(C_src)))   # C_src^{-1/2}
-    A_tgt = np.real(sqrtm(C_tgt))                   # C_tgt^{+1/2}
-
-    X_aligned = X_src @ A_src @ A_tgt
-    return np.clip(X_aligned, -10, 10).astype(np.float32)
-
 def euclidean_alignment(eeg_windows_list):
     covs = [_regularised_cov(w.astype(np.float64)) for w in eeg_windows_list]
     R    = np.stack(covs, axis=0).mean(axis=0)
     Rinv = _matrix_sqrt_inv(R)
     return [Rinv @ w.astype(np.float64) for w in eeg_windows_list]
+
+# ===============================================================
+# CORAL -- CORrelation ALignment  (Sun & Saenko 2016)
+# Aligns target feature covariance to match source covariance.
+# Fully unsupervised: requires only unlabelled target windows.
+# ===============================================================
+def _matrix_sqrt(M):
+    v, U = np.linalg.eigh(M)
+    return U @ np.diag(np.sqrt(np.maximum(v, 1e-10))) @ U.T
+
+def coral_align(Xs, Xt):
+    Xs = Xs.astype(np.float64)
+    Xt = Xt.astype(np.float64)
+    d  = Xs.shape[1]
+    Cs = np.cov(Xs, rowvar=False) + 1e-5 * np.eye(d)
+    Ct = np.cov(Xt, rowvar=False) + 1e-5 * np.eye(d)
+    A  = _matrix_sqrt_inv(Ct) @ _matrix_sqrt(Cs)
+    Xt_aligned  = (Xt - Xt.mean(axis=0)) @ A
+    Xt_aligned += Xs.mean(axis=0)
+    return Xt_aligned.astype(np.float32)
+
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -853,59 +832,25 @@ for ti, tr in enumerate(train_trials):
         all_sids_w.append(sid)
         all_tidx_w.append(ti)
 
-allF_raw = np.array(all_feat_w, dtype=np.float32)
-allY     = np.array(all_labels_w)
-allTK    = np.array(all_tkeys_w)
-allSID   = np.array(all_sids_w)
-allTI    = np.array(all_tidx_w)
+allF_raw  = np.array(all_feat_w, dtype=np.float32)
+allY      = np.array(all_labels_w)
+allTK     = np.array(all_tkeys_w)
+allSID    = np.array(all_sids_w)
+allTI     = np.array(all_tidx_w)
+allIS_AUG = np.zeros(len(allY), dtype=bool)   # False = real window
 
 print(f"Training windows: {len(allY)} in {time.time()-t1:.1f}s")
 
-# ===============================================================
-# EUCLIDEAN ALIGNMENT -- per-subject Riemannian re-centring
-# Updates Riemannian feature columns with EA-aligned covariances
-# ===============================================================
-print("Applying Euclidean Alignment (EA) per subject ...")
-RIEM_START = N_FEAT_EEG + N_FEAT_MUSE + N_FEAT_BVP + N_FEAT_HR + N_FEAT_PPI + N_FEAT_FAA
-
-_sid_to_ew   = defaultdict(list)   # sid -> [ew, ...]  window order
-_sid_to_gidx = defaultdict(list)   # sid -> [global_row_idx, ...]
-
-for ti, tr in enumerate(train_trials):
-    sid = tr["sid"]; eeg = tr["eeg"]; bvp = tr["bvp"]; band = tr["band"]
-    dur2 = min(eeg.shape[1]/EEG_SR, band.shape[1]/BAND_SR, len(bvp)/TRAIN_BVP_SR)
-    step2 = WINDOW_SEC * (1 - OVERLAP_FRAC)
-    for wi in range(int((dur2 - WINDOW_SEC) / step2) + 1):
-        e_s = int(wi * step2 * EEG_SR); e_e = e_s + EEG_WIN
-        if e_e > eeg.shape[1]: break
-        _sid_to_ew[sid].append(eeg[:, e_s:e_e])
-
-for gidx, sid in enumerate(allSID):
-    _sid_to_gidx[sid].append(gidx)
-
-for sid in sorted(_sid_to_ew.keys()):
-    ew_list = _sid_to_ew[sid]; gidxs = _sid_to_gidx[sid]
-    if len(ew_list) < 2: continue
-    aligned = euclidean_alignment(ew_list)
-    for k, gidx in enumerate(gidxs):
-        if k < len(aligned):
-            allF_raw[gidx, RIEM_START:RIEM_START+N_FEAT_RIEM] = \
-                extract_riemannian_features(np.array(aligned[k], dtype=np.float32))
-
-print("EA done -- Riemannian features updated with subject-aligned covariances.")
-
-# ═══════════════════════════════════════════════════════════════
-# BALANCED FOLD ASSIGNMENT  (must happen before preprocessing)
-# ═══════════════════════════════════════════════════════════════
+# ================================================================
+# BALANCED FOLD ASSIGNMENT  moved BEFORE augmentation & EA
+# Fold assignment must precede both so they can be fold-aware.
 print("\nBalanced fold assignment ...")
 
 labels_arr = np.array([tr["label"] for tr in train_trials])
 
 subj_emo_trial = {}
 for ti, tr in enumerate(train_trials):
-    sid = tr["sid"]
-    lbl = tr["label"]
-    subj_emo_trial.setdefault(sid, {})[lbl] = ti
+    subj_emo_trial.setdefault(tr["sid"], {})[tr["label"]] = ti
 
 rng_fold = np.random.RandomState(123)
 shuffled_subs = sorted(subj_emo_trial.keys())
@@ -918,14 +863,122 @@ for g_idx, sid in enumerate(shuffled_subs):
         if emo_idx in subj_emo_trial[sid]:
             trial_pos[subj_emo_trial[sid][emo_idx]] = (group + emo_idx) % 4
 
-win_pos = np.array([trial_pos[ti] for ti in allTI])
+# Assign fold to every ORIGINAL window now, before augmentation or EA
+win_pos_orig = np.array([trial_pos[ti] for ti in allTI])
 
 for fk in range(4):
     te_t = [ti for ti, p in trial_pos.items() if p == fk]
     c = Counter(labels_arr[te_t].tolist())
     print(f"Fold {fk}: test clips={len(te_t)} emotions={dict(sorted(c.items()))}")
 
-# ═══════════════════════════════════════════════════════════════
+# FEATURE-SPACE DATA AUGMENTATION  (training windows only)
+# FIX: MixUp partner is drawn from the SAME fold only, so synthetic
+#      training samples never contain information from test-fold windows.
+AUG_NOISE_COPIES = 2
+AUG_MIXUP_COPIES = 1
+AUG_NOISE_STD    = 0.05
+AUG_MIXUP_ALPHA  = 0.4
+
+print("Augmenting training windows ...")
+rng_aug  = np.random.RandomState(7)
+feat_std = np.std(allF_raw[win_pos_orig != TEST_FOLD], axis=0) + 1e-8  # train-fold only
+
+# Key change: index by (class, fold) so MixUp never crosses fold boundaries
+cls_fold_idx = {
+    (c, fk): np.where((allY == c) & (win_pos_orig == fk))[0]
+    for c in range(NUM_CLASSES) for fk in range(4)
+}
+
+aug_feats, aug_labels, aug_tkeys, aug_sids, aug_tidxs, aug_winpos = [], [], [], [], [], []
+
+for orig_idx in range(len(allY)):
+    lbl  = allY[orig_idx];   feat = allF_raw[orig_idx]
+    sid  = allSID[orig_idx]; tkey = allTK[orig_idx]
+    ti   = allTI[orig_idx];  fk   = int(win_pos_orig[orig_idx])
+
+    for _ in range(AUG_NOISE_COPIES):
+        noise = rng_aug.randn(feat.shape[0]).astype(np.float32) * feat_std * AUG_NOISE_STD
+        aug_feats.append(feat + noise)
+        aug_labels.append(lbl); aug_tkeys.append(tkey)
+        aug_sids.append(sid);   aug_tidxs.append(ti); aug_winpos.append(fk)
+
+    # MixUp: only pool partners from the SAME fold and class
+    pool = cls_fold_idx[(lbl, fk)]
+    diff = pool[allSID[pool] != sid]
+    pool = diff if len(diff) > 0 else pool
+
+    for _ in range(AUG_MIXUP_COPIES):
+        if len(pool) == 0:
+            continue
+        j   = rng_aug.choice(pool)
+        lam = float(rng_aug.beta(AUG_MIXUP_ALPHA, AUG_MIXUP_ALPHA))
+        mixed = (lam * feat + (1 - lam) * allF_raw[j]).astype(np.float32)
+        aug_feats.append(mixed)
+        aug_labels.append(lbl); aug_tkeys.append(tkey)
+        aug_sids.append(sid);   aug_tidxs.append(ti); aug_winpos.append(fk)
+
+if aug_feats:
+    allF_raw  = np.vstack([allF_raw, np.array(aug_feats, dtype=np.float32)])
+    allY      = np.concatenate([allY,  np.array(aug_labels)])
+    allTK     = np.concatenate([allTK, np.array(aug_tkeys)])
+    allSID    = np.concatenate([allSID, np.array(aug_sids)])
+    allTI     = np.concatenate([allTI,  np.array(aug_tidxs)])
+    allIS_AUG = np.concatenate([allIS_AUG, np.ones(len(aug_feats), dtype=bool)])
+    # Augmented windows inherit the fold of their source (no cross-fold bleed)
+    win_pos = np.concatenate([win_pos_orig, np.array(aug_winpos)])
+    print(f"After augmentation: {len(allY)} total windows ({len(aug_feats)} synthetic)")
+else:
+    win_pos = win_pos_orig.copy()
+
+# EUCLIDEAN ALIGNMENT -- per-subject Riemannian re-centring
+# FIX: R (mean covariance) is estimated from TRAINING-FOLD windows only.
+#      The derived Rinv is then applied to ALL windows of the subject
+#      so test windows are correctly aligned without their EEG
+#      contributing to the alignment matrix.
+print("Applying Euclidean Alignment (EA) per subject (train-fold only for R) ...")
+RIEM_START = N_FEAT_EEG + N_FEAT_MUSE + N_FEAT_BVP + N_FEAT_HR + N_FEAT_PPI + N_FEAT_FAA
+
+_sid_to_train_ew = defaultdict(list)  # train-fold windows -> fit R
+_sid_to_all_ew   = defaultdict(list)  # all windows        -> aligned with train-derived R
+_sid_to_gidx     = defaultdict(list)  # global row indices in allF_raw
+
+for ti, tr in enumerate(train_trials):
+    sid = tr["sid"]; eeg = tr["eeg"]; bvp = tr["bvp"]; band = tr["band"]
+    dur2  = min(eeg.shape[1]/EEG_SR, band.shape[1]/BAND_SR, len(bvp)/TRAIN_BVP_SR)
+    step2 = WINDOW_SEC * (1 - OVERLAP_FRAC)
+    is_train_trial = (trial_pos.get(ti, TEST_FOLD) != TEST_FOLD)
+    for wi in range(int((dur2 - WINDOW_SEC) / step2) + 1):
+        e_s = int(wi * step2 * EEG_SR); e_e = e_s + EEG_WIN
+        if e_e > eeg.shape[1]:
+            break
+        window = eeg[:, e_s:e_e]
+        _sid_to_all_ew[sid].append(window)
+        if is_train_trial:
+            _sid_to_train_ew[sid].append(window)  # only train-fold for R
+
+for gidx, sid in enumerate(allSID):
+    _sid_to_gidx[sid].append(gidx)
+
+for sid in sorted(_sid_to_all_ew.keys()):
+    train_ew = _sid_to_train_ew.get(sid, [])
+    if len(train_ew) < 2:
+        continue  # need >= 2 windows to estimate a stable R
+
+    # Compute R from training-fold windows ONLY -- no test leakage
+    covs = [_regularised_cov(w.astype(np.float64)) for w in train_ew]
+    R    = np.stack(covs, axis=0).mean(axis=0)
+    Rinv = _matrix_sqrt_inv(R)
+
+    # Apply the train-derived Rinv to ALL windows of this subject
+    all_ew = _sid_to_all_ew[sid]
+    gidxs  = _sid_to_gidx[sid]
+    for k, window in enumerate(all_ew):
+        if k < len(gidxs):
+            aligned = Rinv @ window.astype(np.float64)
+            allF_raw[gidxs[k], RIEM_START:RIEM_START+N_FEAT_RIEM] =                 extract_riemannian_features(np.array(aligned, dtype=np.float32))
+
+print("EA done -- R fitted on train-fold only, applied to all windows (no test leakage).")
+
 # PREPROCESS  -  fit on non-test-fold windows only (no leakage)
 # ═══════════════════════════════════════════════════════════════
 print("\nApplying preprocessing (fit on non-TEST_FOLD windows only) ...")
@@ -963,220 +1016,296 @@ N_FEATURES = allF_n.shape[1]
 print("Final feature dims:", N_FEATURES)
 
 # ═══════════════════════════════════════════════════════════════
-# PER-FOLD MI
-# ═══════════════════════════════════════════════════════════════
+
+
+# ================================================================
+# MAX EFFORT  -  EXTRA IMPORTS
+# ================================================================
+from sklearn.ensemble import HistGradientBoostingClassifier, StackingClassifier
+from sklearn.svm import SVC
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.decomposition import PCA
+from sklearn.neighbors import KNeighborsClassifier
+import xgboost as xgb
+from imblearn.over_sampling import SMOTE
+
+# ================================================================
+# HELPERS
+# ================================================================
+def smooth_probs_ema(probs, alpha=0.4):
+    # Causal exponential moving average over consecutive windows.
+    out = probs.copy().astype(np.float64)
+    for t in range(1, len(out)):
+        out[t] = alpha * probs[t] + (1 - alpha) * out[t - 1]
+    return out
+
+def subject_recentre(trF, teF):
+    # Shift test features so their mean matches training mean (unsupervised).
+    return teF - (teF.mean(axis=0) - trF.mean(axis=0))
+
+def make_lda(sh=0.3):
+    from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+    return LinearDiscriminantAnalysis(solver="lsqr", shrinkage=sh)
+
+def make_hgb():
+    return HistGradientBoostingClassifier(
+        max_iter=400, learning_rate=0.05, max_depth=4,
+        min_samples_leaf=20, l2_regularization=0.1,
+        class_weight="balanced", random_state=42)
+
+def make_xgb():
+    return xgb.XGBClassifier(
+        n_estimators=400, learning_rate=0.05, max_depth=4,
+        subsample=0.8, colsample_bytree=0.8,
+        eval_metric="mlogloss", random_state=42,
+        verbosity=0)
+
+def make_rbf_svm():
+    return CalibratedClassifierCV(
+        SVC(kernel="rbf", C=10, gamma="scale",
+            class_weight="balanced", probability=False),
+        cv=3, method="isotonic")
+
+def make_knn():
+    return KNeighborsClassifier(
+        n_neighbors=7, metric="euclidean",
+        weights="distance", n_jobs=-1)
+
+def build_stack(sh=0.3):
+    return StackingClassifier(
+        estimators=[
+            ("lda", make_lda(sh)),
+            ("hgb", make_hgb()),
+            ("xgb", make_xgb()),
+            ("svm", make_rbf_svm()),
+            ("knn", make_knn()),
+        ],
+        final_estimator=make_lda(0.5),
+        stack_method="predict_proba",
+        cv=3, passthrough=False, n_jobs=-1)
+
+# ================================================================
+# PER-FOLD MI  (restricted to non-TEST_FOLD folds only)
+# ================================================================
 print("\nComputing per-fold MI ...")
 mi_per_fold = {}
-
 for fk in range(4):
-    tr_mask_mi = (win_pos != fk) & (win_pos != (fk + 1) % 4)
-    tr_idx_mi = np.where(tr_mask_mi)[0]
+    tr_mask_mi = (win_pos != fk) & (win_pos != TEST_FOLD)
+    tr_idx_mi  = np.where(tr_mask_mi)[0]
+    sub = (np.random.RandomState(42).choice(tr_idx_mi, 2000, replace=False)
+           if len(tr_idx_mi) > 2000 else tr_idx_mi)
+    mi_per_fold[fk] = mutual_info_classif(
+        allF_n[sub], allY[sub], random_state=42, n_neighbors=5)
 
-    sub = (
-        np.random.RandomState(42).choice(tr_idx_mi, 2000, replace=False)
-        if len(tr_idx_mi) > 2000 else tr_idx_mi
-    )
+# ================================================================
+# HYPERPARAMETER SEARCH  (non-TEST_FOLD folds only)
+# ================================================================
+print("\nHyperparameter search (non-test folds only) ...")
+K_GRID  = [60, 100, 160, N_FEATURES]
+SH_GRID = [0.05, 0.1, 0.3, 0.5, 0.7]
+non_test_folds = [fk for fk in range(4) if fk != TEST_FOLD]
 
-    mi = mutual_info_classif(allF_n[sub], allY[sub], random_state=42, n_neighbors=5)
-    mi_per_fold[fk] = mi
-
-# ═══════════════════════════════════════════════════════════════
-# SELECT FINAL SVM HYPERPARAMETERS  (no 3-component ceiling unlike LDA)
-# ═══════════════════════════════════════════════════════════════
-print("\nSelecting final SVM hyperparameters ...")
-
-K_GRID = [60, 80, 120, N_FEATURES]
-C_GRID = [0.001, 0.01, 0.1, 1.0, 10.0]
-
-grid_scores = []
-
+best_val, FINAL_K, FINAL_SH = -1.0, 100, 0.3
 for K in K_GRID:
-    for C in C_GRID:
-        fold_scores = []
-
-        for fk in range(4):
-            te_mask = (win_pos == fk)
-            vl_mask = (win_pos == (fk + 1) % 4)
-            tr_mask = ~te_mask & ~vl_mask
-
-            trF = allF_n[tr_mask]
-            trY = allY[tr_mask]
-            vlF = allF_n[vl_mask]
-            vlY = allY[vl_mask]
-
-            mi_ranked = np.argsort(-mi_per_fold[fk])
-            fi = mi_ranked[:K]
-
+    for sh in SH_GRID:
+        scores = []
+        for fk in non_test_folds:
+            vl_m = (win_pos == fk)
+            tr_m = (win_pos != fk) & (win_pos != TEST_FOLD)
+            fi   = np.argsort(-mi_per_fold[fk])[:K]
             try:
-                clf = make_linear_svm(C=C)
-                clf.fit(trF[:, fi], trY)
-                sc = float((clf.predict(vlF[:, fi]) == vlY).mean())
-                fold_scores.append(sc)
+                clf = make_lda(sh)
+                clf.fit(allF_n[tr_m][:, fi], allY[tr_m])
+                scores.append(float((clf.predict(allF_n[vl_m][:, fi]) == allY[vl_m]).mean()))
             except Exception:
-                fold_scores.append(-1.0)
+                scores.append(-1.0)
+        sc = float(np.mean(scores))
+        if sc > best_val:
+            best_val, FINAL_K, FINAL_SH = sc, K, sh
 
-        mean_sc = np.mean(fold_scores)
-        grid_scores.append((mean_sc, K, C))
-        print(f'  K={K:4d}  C={C:6.1f}  val_acc={mean_sc:.4f}')
+print(f"Best val={best_val:.4f}  K={FINAL_K}  shrinkage={FINAL_SH}")
 
-grid_scores.sort(reverse=True, key=lambda x: x[0])
-best_mean_val, FINAL_K, FINAL_C = grid_scores[0]
-
-print(f"Chosen final params: K={FINAL_K}, C={FINAL_C}, mean_val={best_mean_val:.4f}")
-
-# ═══════════════════════════════════════════════════════════════
-# TRAIN FINAL MODEL ON NON-TEST FOLDS
-# ═══════════════════════════════════════════════════════════════
-print(f"\nTraining final SVM on folds != TEST_FOLD ({TEST_FOLD}) ...")
-
+# ================================================================
+# TRAIN / TEST SPLIT
+# ================================================================
 train_mask = (win_pos != TEST_FOLD)
 test_mask  = (win_pos == TEST_FOLD)
-trF_final  = allF_n[train_mask]
-trY_final  = allY[train_mask]
-teF_final  = allF_n[test_mask]   # already normalised with train-fold stats
-teY_final  = allY[test_mask]
-teTK       = allTK[test_mask]
-teSID      = allSID[test_mask]
-print(f"  Train windows : {len(trY_final)}")
-print(f"  Test  windows : {len(teY_final)}")
+trF_all = allF_n[train_mask];  trY_all = allY[train_mask]
+teF_all = allF_n[test_mask];   teY_all = allY[test_mask]
+teTK    = allTK[test_mask];    teSID   = allSID[test_mask]
+print(f"  Train windows: {len(trY_all)}   Test windows: {len(teY_all)}")
 
-sub_idx = (
-    np.random.RandomState(42).choice(len(trF_final), 2000, replace=False)
-    if len(trF_final) > 2000 else np.arange(len(trF_final))
-)
-# CORAL: align train features towards test-subject distribution
-print("Applying CORAL alignment on final test split ...")
-teF_final = coral_align(teF_final, teF_final)  # identity -- target stays as-is
-trF_final_c = coral_align(trF_final, teF_final)
+# Global MI on full train set
+sub_g = (np.random.RandomState(42).choice(len(trF_all), 2000, replace=False)
+         if len(trF_all) > 2000 else np.arange(len(trF_all)))
+mi_g  = mutual_info_classif(trF_all[sub_g], trY_all[sub_g], random_state=42, n_neighbors=5)
+fi_g  = np.argsort(-mi_g)[:FINAL_K]
 
-mi_global         = mutual_info_classif(trF_final_c[sub_idx], trY_final[sub_idx], random_state=42, n_neighbors=5)
-final_feature_idx = np.argsort(-mi_global)[:FINAL_K]
+trF = trF_all[:, fi_g]
+teF = teF_all[:, fi_g]
 
-final_clf = make_linear_svm(C=FINAL_C)
-final_clf.fit(trF_final_c[:, final_feature_idx], trY_final)
-print("Final model trained.")
-print("\nTraining sanity-check report:")
-print(classification_report(trY_final, final_clf.predict(trF_final_c[:, final_feature_idx]),
-    target_names=[IDX_TO_LABEL[i] for i in range(NUM_CLASSES)], zero_division=0))
+# ── SMOTE: oversample minority classes (train only) ─────────────
+print("Applying SMOTE ...")
+counts = np.bincount(trY_all)
+print(f"  Before SMOTE: {dict(enumerate(counts))}")
+try:
+    sm = SMOTE(random_state=42, k_neighbors=5)
+    trF_sm, trY_sm = sm.fit_resample(trF, trY_all)
+    print(f"  After  SMOTE: {dict(enumerate(np.bincount(trY_sm)))}")
+except Exception as e:
+    trF_sm, trY_sm = trF, trY_all
+    print(f"  SMOTE skipped: {e}")
 
-# ═══════════════════════════════════════════════════════════════
-# EVALUATE ON HELD-OUT TEST SPLIT
-# ═══════════════════════════════════════════════════════════════
-# teF_final is already z-scored with train-fold stats (no leakage)
-te_probs = final_clf.predict_proba(teF_final[:, final_feature_idx])
-te_preds = np.argmax(te_probs, axis=1)
+# ── PCA: decorrelate, keep 95% variance ─────────────────────────
+pca = PCA(n_components=0.95, random_state=42)
+trF_pca = pca.fit_transform(trF_sm)
+teF_pca = pca.transform(teF)
+print(f"  PCA: {trF_sm.shape[1]} -> {trF_pca.shape[1]} components")
+
+# ── Stacking ensemble ───────────────────────────────────────────
+print("\nFitting stacking ensemble ...")
+stack_clf = build_stack(FINAL_SH)
+stack_clf.fit(trF_pca, trY_sm)
+tr_hat = stack_clf.predict(trF_pca)
+print(f"  Train accuracy (sanity): {(tr_hat == trY_sm).mean():.4f}")
+
+# ================================================================
+# EVALUATE: TEST SPLIT
+# ================================================================
+print("\nEvaluating on test split ...")
+te_probs_raw = stack_clf.predict_proba(teF_pca)
 
 trial_rows, window_rows = [], []
 for tkey in sorted(set(teTK)):
-    m = (teTK == tkey)
-    probs = te_probs[m]; preds = te_preds[m]; true_lbl = int(teY_final[m][0])
-    for r in range(len(preds)):
-        window_rows.append({"fold": TEST_FOLD, "trial_key": tkey, "window_idx": r,
+    m        = (teTK == tkey)
+    probs_t  = smooth_probs_ema(te_probs_raw[m], alpha=0.4)
+    preds_t  = np.argmax(probs_t, axis=1)
+    true_lbl = int(teY_all[m][0])
+    for r in range(len(preds_t)):
+        window_rows.append({
+            "fold": TEST_FOLD, "trial_key": tkey, "window_idx": r,
             "true_idx": true_lbl, "true_label": IDX_TO_LABEL[true_lbl],
-            "pred_idx": int(preds[r]), "pred_label": IDX_TO_LABEL[int(preds[r])],
-            "prob_NEUTRAL": float(probs[r,0]), "prob_ENTHUSIASM": float(probs[r,1]),
-            "prob_SADNESS": float(probs[r,2]), "prob_FEAR": float(probs[r,3])})
-    pi, conf, mp = trial_vote_from_probs(probs)
-    trial_rows.append({"fold": TEST_FOLD, "trial_key": tkey, "n_windows": int(m.sum()),
+            "pred_idx": int(preds_t[r]), "pred_label": IDX_TO_LABEL[int(preds_t[r])],
+            "prob_NEUTRAL":    float(probs_t[r, 0]),
+            "prob_ENTHUSIASM": float(probs_t[r, 1]),
+            "prob_SADNESS":    float(probs_t[r, 2]),
+            "prob_FEAR":       float(probs_t[r, 3]),
+        })
+    pi, conf, mp = trial_vote_from_probs(probs_t)
+    trial_rows.append({
+        "fold": TEST_FOLD, "trial_key": tkey, "n_windows": int(m.sum()),
         "true_idx": true_lbl, "true_label": IDX_TO_LABEL[true_lbl],
         "trial_pred_idx": pi, "trial_pred_label": IDX_TO_LABEL[pi],
-        "trial_confidence": conf, "prob_NEUTRAL": float(mp[0]),
-        "prob_ENTHUSIASM": float(mp[1]), "prob_SADNESS": float(mp[2]),
-        "prob_FEAR": float(mp[3])})
+        "trial_confidence": conf,
+        "prob_NEUTRAL":    float(mp[0]), "prob_ENTHUSIASM": float(mp[1]),
+        "prob_SADNESS":    float(mp[2]), "prob_FEAR":       float(mp[3]),
+    })
 
-# ═══════════════════════════════════════════════════════════════
-# SAVE + REPORT
-# ═══════════════════════════════════════════════════════════════
 trial_df  = pd.DataFrame(trial_rows)
 window_df = pd.DataFrame(window_rows)
-trial_df.to_csv(OUT_TRIAL_CSV,   index=False)
-window_df.to_csv(OUT_WINDOW_CSV, index=False)
-print(f"Saved -> {OUT_TRIAL_CSV}")
-print(f"Saved -> {OUT_WINDOW_CSV}")
-print(trial_df.to_string())
+trial_df.to_csv("/kaggle/working/maxeffort_trial_predictions.csv",   index=False)
+window_df.to_csv("/kaggle/working/maxeffort_window_predictions.csv", index=False)
 
 y_true_w = window_df["true_idx"].astype(int).values
 y_pred_w = window_df["pred_idx"].astype(int).values
-print("\n" + "="*60)
-print("TEST SPLIT  -  WINDOW-LEVEL RESULTS")
-print("="*60)
-print(f"Window accuracy: {(y_true_w==y_pred_w).mean():.4f}")
+print("\n" + "=" * 60)
+print("MAX EFFORT  --  TEST WINDOW-LEVEL")
+print("=" * 60)
+print(f"Window accuracy: {(y_true_w == y_pred_w).mean():.4f}")
 print(classification_report(y_true_w, y_pred_w,
-    target_names=[IDX_TO_LABEL[i] for i in range(NUM_CLASSES)], zero_division=0))
-print("Confusion matrix:")
+      target_names=[IDX_TO_LABEL[i] for i in range(NUM_CLASSES)], zero_division=0))
 print(confusion_matrix(y_true_w, y_pred_w, labels=list(range(NUM_CLASSES))))
 
 y_true_t = trial_df["true_idx"].astype(int).values
 y_pred_t = trial_df["trial_pred_idx"].astype(int).values
-print("\n" + "="*60)
-print("TEST SPLIT  -  TRIAL-LEVEL RESULTS")
-print("="*60)
-print(f"Trial accuracy: {(y_true_t==y_pred_t).mean():.4f}")
+print("\n" + "=" * 60)
+print("MAX EFFORT  --  TEST TRIAL-LEVEL")
+print("=" * 60)
+print(f"Trial accuracy: {(y_true_t == y_pred_t).mean():.4f}")
 print(classification_report(y_true_t, y_pred_t,
-    target_names=[IDX_TO_LABEL[i] for i in range(NUM_CLASSES)], zero_division=0))
-print("Confusion matrix:")
+      target_names=[IDX_TO_LABEL[i] for i in range(NUM_CLASSES)], zero_division=0))
 print(confusion_matrix(y_true_t, y_pred_t, labels=list(range(NUM_CLASSES))))
 
-# ===============================================================
-# LEAVE-ONE-SUBJECT-OUT (LOSO) EVALUATION
-# Train on all subjects except one, test on the held-out subject.
-# Repeated for every subject -- strongest cross-subject protocol.
-# Uses FINAL_K and FINAL_SH from fold-based grid search.
-# ===============================================================
-print("\n" + "="*60)
-print("LOSO CROSS-SUBJECT EVALUATION")
-print("="*60)
+# ================================================================
+# LOSO  -- per-subject: SMOTE + PCA + stack + re-centring + EMA
+# ================================================================
+print("\n" + "=" * 60)
+print("MAX EFFORT  --  LOSO")
+print("=" * 60)
 
-loso_trial_rows = []
-loso_win_rows   = []
-loso_accs       = []
+loso_win_rows, loso_trial_rows, loso_accs = [], [], []
 
 for loso_sid in sorted(set(allSID)):
-    te_m = (allSID == loso_sid)
-    tr_m = ~te_m
+    te_m = (allSID == loso_sid) & ~allIS_AUG
+    tr_m = ~(allSID == loso_sid)
     if te_m.sum() == 0 or tr_m.sum() == 0:
         continue
 
-    vt_l = VarianceThreshold(threshold=0.001)
+    # Fresh VT + z-score on training subjects only
+    from sklearn.feature_selection import VarianceThreshold as _VT
+    vt_l = _VT(threshold=0.001)
     vt_l.fit(allF_raw[tr_m])
     trF_l = vt_l.transform(allF_raw[tr_m])
     teF_l = vt_l.transform(allF_raw[te_m])
-
-    mu_l = trF_l.mean(axis=0)
-    sd_l = np.where(trF_l.std(axis=0) < 1e-8, 1.0, trF_l.std(axis=0))
+    mu_l  = trF_l.mean(axis=0)
+    sd_l  = np.where(trF_l.std(axis=0) < 1e-8, 1.0, trF_l.std(axis=0))
     trF_l = np.clip((trF_l - mu_l) / sd_l, -10, 10)
     teF_l = np.clip((teF_l - mu_l) / sd_l, -10, 10)
 
+    # Unsupervised test-time re-centring (no labels needed)
+    teF_l = subject_recentre(trF_l, teF_l)
+
     trY_l = allY[tr_m]; teY_l = allY[te_m]; teTK_l = allTK[te_m]
 
-    # CORAL: align training feature distribution towards this test subject
-    trF_l = coral_align(trF_l, teF_l)
+    # MI feature selection
+    sub_l  = (np.random.RandomState(42).choice(len(trF_l), 2000, replace=False)
+              if len(trF_l) > 2000 else np.arange(len(trF_l)))
+    mi_l   = mutual_info_classif(trF_l[sub_l], trY_l[sub_l], random_state=42, n_neighbors=5)
+    fi_l   = np.argsort(-mi_l)[:FINAL_K]
+    trF_lk = trF_l[:, fi_l]
+    teF_lk = teF_l[:, fi_l]
 
-    sub_l = (np.random.RandomState(42).choice(len(trF_l), 2000, replace=False)
-             if len(trF_l) > 2000 else np.arange(len(trF_l)))
-    mi_l  = mutual_info_classif(trF_l[sub_l], trY_l[sub_l], random_state=42, n_neighbors=5)
-    fi_l  = np.argsort(-mi_l)[:FINAL_K]
-
+    # SMOTE
     try:
-        clf_l = make_linear_svm(C=FINAL_C)
-        clf_l.fit(trF_l[:, fi_l], trY_l)
-        probs_l = clf_l.predict_proba(teF_l[:, fi_l])
-        preds_l = np.argmax(probs_l, axis=1)
+        k_nn = min(5, int(np.bincount(trY_l).min()) - 1)
+        if k_nn >= 1:
+            sm_l = SMOTE(random_state=42, k_neighbors=k_nn)
+            trF_lk, trY_lk = sm_l.fit_resample(trF_lk, trY_l)
+        else:
+            trY_lk = trY_l
+    except Exception:
+        trY_lk = trY_l
+
+    # PCA
+    pca_l  = PCA(n_components=0.95, random_state=42)
+    trF_lp = pca_l.fit_transform(trF_lk)
+    teF_lp = pca_l.transform(teF_lk)
+
+    # Stacking ensemble with LDA fallback
+    try:
+        clf_l = build_stack(FINAL_SH)
+        clf_l.fit(trF_lp, trY_lk)
+        probs_l = clf_l.predict_proba(teF_lp)
     except Exception as ex:
-        print(f"  [LOSO] {loso_sid} failed: {ex}")
-        continue
+        print(f"  [{loso_sid}] stack failed ({ex}), using LDA fallback")
+        from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+        clf_l   = LinearDiscriminantAnalysis(solver="lsqr", shrinkage=FINAL_SH)
+        clf_l.fit(trF_lp, trY_lk)
+        probs_l = clf_l.predict_proba(teF_lp)
 
-    win_acc = float((preds_l == teY_l).mean())
-    loso_accs.append((loso_sid, win_acc, int(te_m.sum())))
-
+    # EMA smoothing + vote per trial
+    win_correct = []
     for tkey in sorted(set(teTK_l)):
-        m  = (teTK_l == tkey)
-        pr = probs_l[m]; pd = preds_l[m]; tl = int(teY_l[m][0])
-        for r in range(len(pd)):
+        m   = (teTK_l == tkey)
+        pr  = smooth_probs_ema(probs_l[m], alpha=0.4)
+        pd_ = np.argmax(pr, axis=1)
+        tl  = int(teY_l[m][0])
+        win_correct.extend((pd_ == teY_l[m]).tolist())
+        for r in range(len(pd_)):
             loso_win_rows.append({
                 "subject": loso_sid, "trial_key": tkey, "window_idx": r,
                 "true_idx": tl, "true_label": IDX_TO_LABEL[tl],
-                "pred_idx": int(pd[r]), "pred_label": IDX_TO_LABEL[int(pd[r])],
+                "pred_idx": int(pd_[r]), "pred_label": IDX_TO_LABEL[int(pd_[r])],
             })
         pi, conf, mp = trial_vote_from_probs(pr)
         loso_trial_rows.append({
@@ -1185,40 +1314,41 @@ for loso_sid in sorted(set(allSID)):
             "trial_pred_idx": pi, "trial_pred_label": IDX_TO_LABEL[pi],
             "trial_confidence": conf,
         })
-    print(f"  Subject {loso_sid}: win_acc={win_acc:.3f}  n_wins={int(te_m.sum())}")
 
-pd.DataFrame(loso_trial_rows).to_csv("/kaggle/working/loso_trial_predictions.csv",  index=False)
-pd.DataFrame(loso_win_rows  ).to_csv("/kaggle/working/loso_window_predictions.csv", index=False)
+    w_acc = float(np.mean(win_correct))
+    loso_accs.append((loso_sid, w_acc, int(te_m.sum())))
+    print(f"  Subject {loso_sid}: win_acc={w_acc:.3f}  n_wins={int(te_m.sum())}")
 
-loso_win_df   = pd.DataFrame(loso_win_rows)
-loso_trial_df = pd.DataFrame(loso_trial_rows)
+pd.DataFrame(loso_trial_rows).to_csv("/kaggle/working/maxeffort_loso_trial.csv",  index=False)
+pd.DataFrame(loso_win_rows).to_csv(  "/kaggle/working/maxeffort_loso_window.csv", index=False)
 
-if len(loso_win_df):
-    yt = loso_win_df["true_idx"].astype(int).values
-    yp = loso_win_df["pred_idx"].astype(int).values
-    print("\n" + "="*60)
-    print("LOSO -- WINDOW-LEVEL (all subjects pooled)")
-    print("="*60)
-    print(f"Window accuracy: {(yt==yp).mean():.4f}")
+loso_wdf = pd.DataFrame(loso_win_rows)
+loso_tdf = pd.DataFrame(loso_trial_rows)
+
+if len(loso_wdf):
+    yt = loso_wdf["true_idx"].astype(int).values
+    yp = loso_wdf["pred_idx"].astype(int).values
+    print("\n" + "=" * 60)
+    print("MAX EFFORT  --  LOSO WINDOW-LEVEL (all subjects pooled)")
+    print("=" * 60)
+    print(f"Window accuracy: {(yt == yp).mean():.4f}")
     print(classification_report(yt, yp,
-        target_names=[IDX_TO_LABEL[i] for i in range(NUM_CLASSES)], zero_division=0))
-    print("Confusion matrix:")
+          target_names=[IDX_TO_LABEL[i] for i in range(NUM_CLASSES)], zero_division=0))
     print(confusion_matrix(yt, yp, labels=list(range(NUM_CLASSES))))
 
-if len(loso_trial_df):
-    yt = loso_trial_df["true_idx"].astype(int).values
-    yp = loso_trial_df["trial_pred_idx"].astype(int).values
-    print("\n" + "="*60)
-    print("LOSO -- TRIAL-LEVEL (all subjects pooled)")
-    print("="*60)
-    print(f"Trial accuracy: {(yt==yp).mean():.4f}")
+if len(loso_tdf):
+    yt = loso_tdf["true_idx"].astype(int).values
+    yp = loso_tdf["trial_pred_idx"].astype(int).values
+    print("\n" + "=" * 60)
+    print("MAX EFFORT  --  LOSO TRIAL-LEVEL (all subjects pooled)")
+    print("=" * 60)
+    print(f"Trial accuracy: {(yt == yp).mean():.4f}")
     print(classification_report(yt, yp,
-        target_names=[IDX_TO_LABEL[i] for i in range(NUM_CLASSES)], zero_division=0))
-    print("Confusion matrix:")
+          target_names=[IDX_TO_LABEL[i] for i in range(NUM_CLASSES)], zero_division=0))
     print(confusion_matrix(yt, yp, labels=list(range(NUM_CLASSES))))
     print("\nPer-subject window accuracies:")
     for sid, acc, n in loso_accs:
         print(f"  {sid}: {acc:.3f}  ({n} windows)")
-    mean_loso = float(np.mean([a for _,a,_ in loso_accs]))
-    std_loso  = float(np.std( [a for _,a,_ in loso_accs]))
-    print(f"\nMean LOSO window accuracy: {mean_loso:.4f} +/- {std_loso:.4f}")
+    mean_l = float(np.mean([a for _, a, _ in loso_accs]))
+    std_l  = float(np.std( [a for _, a, _ in loso_accs]))
+    print(f"\nMean LOSO window accuracy: {mean_l:.4f} +/- {std_l:.4f}")

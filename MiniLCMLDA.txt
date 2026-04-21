@@ -21,28 +21,13 @@ import pandas as pd
 from scipy.signal import welch, coherence as sp_coherence, find_peaks, butter, filtfilt
 from scipy.stats import skew, kurtosis
 
+import torch
+import torch.nn as nn
+import torch.utils.data
+
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.feature_selection import VarianceThreshold, mutual_info_classif
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from sklearn.svm import SVC
-
-from sklearn.svm import LinearSVC
-from sklearn.calibration import CalibratedClassifierCV
-
-def make_linear_svm(C=1.0):
-    base = LinearSVC(C=C, class_weight='balanced', max_iter=2000,
-                     random_state=42, dual=True)
-    return CalibratedClassifierCV(base, cv=3, method='isotonic')
-
-
-from sklearn.svm import LinearSVC
-from sklearn.calibration import CalibratedClassifierCV
-
-def make_linear_svm(C=1.0):
-    base = LinearSVC(C=C, class_weight='balanced', max_iter=2000,
-                     random_state=42, dual=True)
-    return CalibratedClassifierCV(base, cv=3, method='isotonic')
-
 
 try:
     from pyriemann.estimation import Covariances as _PyrCov
@@ -127,6 +112,98 @@ N_FEATURES_RAW = (N_FEAT_EEG + N_FEAT_MUSE + N_FEAT_BVP +
                   N_FEAT_HR  + N_FEAT_PPI  + N_FEAT_FAA + N_FEAT_RIEM)
 
 print(f"Raw feature count = {N_FEATURES_RAW}")
+# ═══════════════════════════════════════════════════════════════
+# MINILCM CONFIG
+# ═══════════════════════════════════════════════════════════════
+USE_MINILCM     = True        # set False to skip the neural add-on
+MINILCM_EPOCHS  = 30
+MINILCM_LR      = 1e-3
+MINILCM_BATCH   = 64
+MINILCM_EMB_DIM = 64
+# Safely test CUDA -- Kaggle PyTorch/driver versions sometimes mismatch
+DEVICE = torch.device("cpu")
+if torch.cuda.is_available():
+    try:
+        torch.zeros(1, device="cuda")   # quick kernel smoke-test
+        DEVICE = torch.device("cuda")
+        print(f"[MiniLCM] GPU: {torch.cuda.get_device_name(0)}")
+    except Exception as _cuda_err:
+        print(f"[MiniLCM] CUDA failed ({_cuda_err}) -- using CPU")
+
+# ═══════════════════════════════════════════════════════════════
+# MINILCM  -- CNN + Transformer EEG encoder
+# ═══════════════════════════════════════════════════════════════
+class MiniLCM(nn.Module):
+    def __init__(self, num_classes=NUM_CLASSES):
+        super().__init__()
+        self.conv1 = nn.Conv1d(4, 32, kernel_size=7, padding=3)
+        self.conv2 = nn.Conv1d(32, 64, kernel_size=15, padding=7)
+        enc = nn.TransformerEncoderLayer(d_model=64, nhead=4, dim_feedforward=128,
+                                          batch_first=True, dropout=0.1)
+        self.tr  = nn.TransformerEncoder(enc, num_layers=2)
+        self.fc  = nn.Linear(64, MINILCM_EMB_DIM)
+        self.cls = nn.Linear(MINILCM_EMB_DIM, num_classes)
+
+    def embed(self, x):          # (B,4,T) -> (B,64)
+        x = torch.relu(self.conv1(x))
+        x = torch.relu(self.conv2(x))
+        x = x.transpose(1, 2)
+        x = self.tr(x)
+        return self.fc(x.mean(dim=1))
+
+    def forward(self, x):
+        return self.cls(self.embed(x))
+
+
+def train_minilcm(eeg_windows, labels, train_mask, val_mask):
+    model = MiniLCM().to(DEVICE)
+    opt   = torch.optim.Adam(model.parameters(), lr=MINILCM_LR, weight_decay=1e-4)
+    sch   = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=MINILCM_EPOCHS)
+    crit  = nn.CrossEntropyLoss()
+    X_tr  = torch.tensor(eeg_windows[train_mask], dtype=torch.float32)
+    y_tr  = torch.tensor(labels[train_mask],       dtype=torch.long)
+    X_vl  = torch.tensor(eeg_windows[val_mask],    dtype=torch.float32)
+    y_vl  = torch.tensor(labels[val_mask],          dtype=torch.long)
+    dl_tr = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(X_tr, y_tr),
+        batch_size=MINILCM_BATCH, shuffle=True)
+    best_val, best_state = -1, None
+    for ep in range(1, MINILCM_EPOCHS + 1):
+        model.train()
+        for xb, yb in dl_tr:
+            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
+            opt.zero_grad()
+            crit(model(xb), yb).backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+        sch.step()
+        if ep % 5 == 0 or ep == MINILCM_EPOCHS:
+            model.eval()
+            with torch.no_grad():
+                preds = torch.cat([model(c).argmax(1)
+                    for c in torch.split(X_vl.to(DEVICE), MINILCM_BATCH)]).cpu()
+            val_acc = (preds == y_vl).float().mean().item()
+            if val_acc > best_val:
+                best_val   = val_acc
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            print(f"    [MiniLCM] ep={ep:3d}  val_acc={val_acc:.4f}  best={best_val:.4f}")
+    if best_state:
+        model.load_state_dict(best_state)
+    model.eval()
+    return model
+
+
+def extract_minilcm_embeddings(model, eeg_windows):
+    model.eval()
+    X = torch.tensor(eeg_windows, dtype=torch.float32)
+    embs = []
+    with torch.no_grad():
+        for (xb,) in torch.utils.data.DataLoader(
+                torch.utils.data.TensorDataset(X), batch_size=MINILCM_BATCH):
+            embs.append(model.embed(xb.to(DEVICE)).cpu().numpy())
+    return np.concatenate(embs, axis=0).astype(np.float32)
+
+
 
 # ???????????????????????????????????????????????????????????????
 # BASELINE REDUCTION HELPERS
@@ -629,38 +706,6 @@ def _matrix_sqrt_inv(M):
     v, U = np.linalg.eigh(M)
     return U @ np.diag(1.0/np.sqrt(np.maximum(v, 1e-10))) @ U.T
 
-
-# ===============================================================
-# CORAL -- CORrelation ALignment  (Sun & Saenko 2016)
-# Aligns the covariance of source (train) features to match the
-# target (test subject) feature covariance.
-# Steps:
-#   1. Whiten source:   X_src @ C_src^{-1/2}
-#   2. Re-colour:       result  @ C_tgt^{+1/2}
-# No labels needed -- purely unsupervised.
-# ===============================================================
-def coral_align(X_src, X_tgt, reg=1e-6):
-    """
-    X_src : (N_train, F)  z-scored training features
-    X_tgt : (N_test,  F)  z-scored test features
-    Returns X_src_aligned with same shape as X_src.
-    X_tgt is unchanged -- it is already the target distribution.
-    """
-    from scipy.linalg import sqrtm
-    X_src = np.array(X_src, dtype=np.float64)
-    X_tgt = np.array(X_tgt, dtype=np.float64)
-    F = X_src.shape[1]
-
-    C_src = np.cov(X_src.T) + reg * np.eye(F)
-    C_tgt = np.cov(X_tgt.T) + reg * np.eye(F)
-
-    # matrix square roots -- sqrtm can return complex due to numerics, take real part
-    A_src = np.real(sqrtm(np.linalg.inv(C_src)))   # C_src^{-1/2}
-    A_tgt = np.real(sqrtm(C_tgt))                   # C_tgt^{+1/2}
-
-    X_aligned = X_src @ A_src @ A_tgt
-    return np.clip(X_aligned, -10, 10).astype(np.float32)
-
 def euclidean_alignment(eeg_windows_list):
     covs = [_regularised_cov(w.astype(np.float64)) for w in eeg_windows_list]
     R    = np.stack(covs, axis=0).mean(axis=0)
@@ -802,6 +847,7 @@ all_labels_w = []
 all_tkeys_w = []
 all_sids_w = []
 all_tidx_w = []
+all_eeg_w  = []           # raw EEG windows for MiniLCM
 
 for ti, tr in enumerate(train_trials):
     sid = tr["sid"]
@@ -852,12 +898,14 @@ for ti, tr in enumerate(train_trials):
         all_tkeys_w.append(tkey)
         all_sids_w.append(sid)
         all_tidx_w.append(ti)
+        all_eeg_w.append(ew)       # store raw EEG window
 
 allF_raw = np.array(all_feat_w, dtype=np.float32)
 allY     = np.array(all_labels_w)
 allTK    = np.array(all_tkeys_w)
 allSID   = np.array(all_sids_w)
 allTI    = np.array(all_tidx_w)
+allEEG_w = np.stack(all_eeg_w, axis=0).astype(np.float32)  # (N,4,EEG_WIN)
 
 print(f"Training windows: {len(allY)} in {time.time()-t1:.1f}s")
 
@@ -965,6 +1013,44 @@ print("Final feature dims:", N_FEATURES)
 # ═══════════════════════════════════════════════════════════════
 # PER-FOLD MI
 # ═══════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════
+# MINILCM ADD-ON  (after preprocessing, before grid search)
+# ═══════════════════════════════════════════════════════════════
+if USE_MINILCM:
+    print("\n" + "="*60)
+    print("MINILCM ADD-ON  --  training neural feature extractor")
+    print("="*60)
+    print(f"Device: {DEVICE}  epochs={MINILCM_EPOCHS}  lr={MINILCM_LR}  batch={MINILCM_BATCH}")
+
+    # Per-channel z-score (fit on train fold only, no leakage)
+    eeg_mu  = allEEG_w[tr_win_mask].mean(axis=(0, 2), keepdims=True)
+    eeg_std = allEEG_w[tr_win_mask].std(axis=(0, 2),  keepdims=True)
+    eeg_std = np.where(eeg_std < 1e-8, 1.0, eeg_std)
+    allEEG_norm = ((allEEG_w - eeg_mu) / eeg_std).astype(np.float32)
+
+    # Use fold (TEST_FOLD-1) as validation, rest as training for MiniLCM
+    vl_mask_lcm = (win_pos == (TEST_FOLD - 1) % 4)
+    tr_mask_lcm = tr_win_mask & ~vl_mask_lcm
+
+    minilcm_model = train_minilcm(allEEG_norm, allY, tr_mask_lcm, vl_mask_lcm)
+
+    print("Extracting MiniLCM embeddings ...")
+    lcm_embs = extract_minilcm_embeddings(minilcm_model, allEEG_norm)   # (N, 64)
+    print(f"Embeddings shape: {lcm_embs.shape}")
+
+    # Z-score embeddings with train-fold stats
+    emb_mu  = lcm_embs[tr_win_mask].mean(axis=0)
+    emb_std = lcm_embs[tr_win_mask].std(axis=0)
+    emb_std = np.where(emb_std < 1e-8, 1.0, emb_std)
+    lcm_embs_n = np.clip((lcm_embs - emb_mu) / emb_std, -10, 10)
+
+    # Concatenate to normalised feature matrix
+    allF_n = np.concatenate([allF_n, lcm_embs_n], axis=1)
+    N_FEATURES = allF_n.shape[1]
+    print(f"Feature dims after MiniLCM concat: {N_FEATURES} "
+          f"(handcrafted={N_FEATURES - MINILCM_EMB_DIM} + neural={MINILCM_EMB_DIM})")
+
 print("\nComputing per-fold MI ...")
 mi_per_fold = {}
 
@@ -981,17 +1067,17 @@ for fk in range(4):
     mi_per_fold[fk] = mi
 
 # ═══════════════════════════════════════════════════════════════
-# SELECT FINAL SVM HYPERPARAMETERS  (no 3-component ceiling unlike LDA)
+# SELECT FINAL LDA HYPERPARAMETERS
 # ═══════════════════════════════════════════════════════════════
-print("\nSelecting final SVM hyperparameters ...")
+print("\nSelecting final LDA hyperparameters ...")
 
-K_GRID = [60, 80, 120, N_FEATURES]
-C_GRID = [0.001, 0.01, 0.1, 1.0, 10.0]
+K_GRID = [80, 120, N_FEATURES]
+SH_GRID = ['auto', 0.05, 0.1, 0.3, 0.5, 0.7, 0.9]
 
 grid_scores = []
 
 for K in K_GRID:
-    for C in C_GRID:
+    for sh in SH_GRID:
         fold_scores = []
 
         for fk in range(4):
@@ -1008,7 +1094,7 @@ for K in K_GRID:
             fi = mi_ranked[:K]
 
             try:
-                clf = make_linear_svm(C=C)
+                clf = LinearDiscriminantAnalysis(solver='lsqr', shrinkage=sh)
                 clf.fit(trF[:, fi], trY)
                 sc = float((clf.predict(vlF[:, fi]) == vlY).mean())
                 fold_scores.append(sc)
@@ -1016,18 +1102,17 @@ for K in K_GRID:
                 fold_scores.append(-1.0)
 
         mean_sc = np.mean(fold_scores)
-        grid_scores.append((mean_sc, K, C))
-        print(f'  K={K:4d}  C={C:6.1f}  val_acc={mean_sc:.4f}')
+        grid_scores.append((mean_sc, K, sh))
 
 grid_scores.sort(reverse=True, key=lambda x: x[0])
-best_mean_val, FINAL_K, FINAL_C = grid_scores[0]
+best_mean_val, FINAL_K, FINAL_SH = grid_scores[0]
 
-print(f"Chosen final params: K={FINAL_K}, C={FINAL_C}, mean_val={best_mean_val:.4f}")
+print(f"Chosen final params: K={FINAL_K}, shrinkage={FINAL_SH}, mean_val={best_mean_val:.4f}")
 
 # ═══════════════════════════════════════════════════════════════
 # TRAIN FINAL MODEL ON NON-TEST FOLDS
 # ═══════════════════════════════════════════════════════════════
-print(f"\nTraining final SVM on folds != TEST_FOLD ({TEST_FOLD}) ...")
+print(f"\nTraining final LDA on folds != TEST_FOLD ({TEST_FOLD}) ...")
 
 train_mask = (win_pos != TEST_FOLD)
 test_mask  = (win_pos == TEST_FOLD)
@@ -1044,19 +1129,14 @@ sub_idx = (
     np.random.RandomState(42).choice(len(trF_final), 2000, replace=False)
     if len(trF_final) > 2000 else np.arange(len(trF_final))
 )
-# CORAL: align train features towards test-subject distribution
-print("Applying CORAL alignment on final test split ...")
-teF_final = coral_align(teF_final, teF_final)  # identity -- target stays as-is
-trF_final_c = coral_align(trF_final, teF_final)
-
-mi_global         = mutual_info_classif(trF_final_c[sub_idx], trY_final[sub_idx], random_state=42, n_neighbors=5)
+mi_global         = mutual_info_classif(trF_final[sub_idx], trY_final[sub_idx], random_state=42, n_neighbors=5)
 final_feature_idx = np.argsort(-mi_global)[:FINAL_K]
 
-final_clf = make_linear_svm(C=FINAL_C)
-final_clf.fit(trF_final_c[:, final_feature_idx], trY_final)
+final_clf = LinearDiscriminantAnalysis(solver='lsqr', shrinkage=FINAL_SH)
+final_clf.fit(trF_final[:, final_feature_idx], trY_final)
 print("Final model trained.")
 print("\nTraining sanity-check report:")
-print(classification_report(trY_final, final_clf.predict(trF_final_c[:, final_feature_idx]),
+print(classification_report(trY_final, final_clf.predict(trF_final[:, final_feature_idx]),
     target_names=[IDX_TO_LABEL[i] for i in range(NUM_CLASSES)], zero_division=0))
 
 # ═══════════════════════════════════════════════════════════════
@@ -1149,16 +1229,13 @@ for loso_sid in sorted(set(allSID)):
 
     trY_l = allY[tr_m]; teY_l = allY[te_m]; teTK_l = allTK[te_m]
 
-    # CORAL: align training feature distribution towards this test subject
-    trF_l = coral_align(trF_l, teF_l)
-
     sub_l = (np.random.RandomState(42).choice(len(trF_l), 2000, replace=False)
              if len(trF_l) > 2000 else np.arange(len(trF_l)))
     mi_l  = mutual_info_classif(trF_l[sub_l], trY_l[sub_l], random_state=42, n_neighbors=5)
     fi_l  = np.argsort(-mi_l)[:FINAL_K]
 
     try:
-        clf_l = make_linear_svm(C=FINAL_C)
+        clf_l = LinearDiscriminantAnalysis(solver="lsqr", shrinkage=FINAL_SH)
         clf_l.fit(trF_l[:, fi_l], trY_l)
         probs_l = clf_l.predict_proba(teF_l[:, fi_l])
         preds_l = np.argmax(probs_l, axis=1)
@@ -1171,12 +1248,12 @@ for loso_sid in sorted(set(allSID)):
 
     for tkey in sorted(set(teTK_l)):
         m  = (teTK_l == tkey)
-        pr = probs_l[m]; pd = preds_l[m]; tl = int(teY_l[m][0])
-        for r in range(len(pd)):
+        pr = probs_l[m]; pd_ = preds_l[m]; tl = int(teY_l[m][0])
+        for r in range(len(pd_)):
             loso_win_rows.append({
                 "subject": loso_sid, "trial_key": tkey, "window_idx": r,
                 "true_idx": tl, "true_label": IDX_TO_LABEL[tl],
-                "pred_idx": int(pd[r]), "pred_label": IDX_TO_LABEL[int(pd[r])],
+                "pred_idx": int(pd_[r]), "pred_label": IDX_TO_LABEL[int(pd_[r])],
             })
         pi, conf, mp = trial_vote_from_probs(pr)
         loso_trial_rows.append({
