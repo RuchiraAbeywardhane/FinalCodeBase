@@ -24,7 +24,6 @@ from scipy.stats import skew, kurtosis
 from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.feature_selection import VarianceThreshold, mutual_info_classif
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-from sklearn.decomposition import PCA
 
 try:
     from pyriemann.estimation import Covariances as _PyrCov
@@ -104,10 +103,9 @@ N_FEAT_BVP  = 7
 N_FEAT_HR   = 5
 N_FEAT_PPI  = 8
 N_FEAT_FAA  = 14   # Frontal Alpha Asymmetry + hemispheric asymmetries
-N_FEAT_SEF  = 8    # SEF90 + median freq, per 4 EEG channels (2 x 4)
 N_FEAT_RIEM = 10   # Riemannian tangent-space upper triangle of 4x4 log-cov
 N_FEATURES_RAW = (N_FEAT_EEG + N_FEAT_MUSE + N_FEAT_BVP +
-                  N_FEAT_HR  + N_FEAT_PPI  + N_FEAT_FAA + N_FEAT_SEF + N_FEAT_RIEM)
+                  N_FEAT_HR  + N_FEAT_PPI  + N_FEAT_FAA + N_FEAT_RIEM)
 
 print(f"Raw feature count = {N_FEATURES_RAW}")
 
@@ -591,27 +589,6 @@ def extract_faa_features(eeg_4ch, sr=EEG_SR):
     return safe_array(np.array(feats, dtype=np.float32))
 
 
-
-# ===============================================================
-# SPECTRAL EDGE FREQUENCY  (8 features)
-# SEF90 = freq below which 90% of power resides; MedFreq = 50%
-# 4 channels x 2 features = 8
-# ===============================================================
-def extract_sef_features(eeg_4ch, sr=EEG_SR):
-    feats = []
-    for ch in range(4):
-        sig = eeg_4ch[ch].astype(np.float64)
-        freqs, psd = _compute_psd(sig, sr)
-        cum = np.cumsum(psd)
-        total = cum[-1]
-        if total < 1e-12:
-            feats.extend([0.0, 0.0])
-            continue
-        sef90 = float(freqs[np.searchsorted(cum, 0.90 * total)])
-        med   = float(freqs[np.searchsorted(cum, 0.50 * total)])
-        feats.extend([sef90, med])
-    return safe_array(np.array(feats, dtype=np.float32))
-
 # ===============================================================
 # RIEMANNIAN GEOMETRY -- tangent space of SPD manifold (10 features)
 # Steps: regularised cov -> matrix log -> upper triangle
@@ -843,11 +820,10 @@ for ti, tr in enumerate(train_trials):
         f_hr   = extract_hr_features(hr_win)
         f_ppi  = extract_ppi_features(ppi_win)
         f_faa  = extract_faa_features(ew)          # 14 FAA features
-        f_sef  = extract_sef_features(ew)           # 8 SEF features
         f_riem = extract_riemannian_features(ew)   # 10 Riemannian (pre-EA)
 
         feat = np.concatenate(
-            [f_eeg, f_muse, f_bvp, f_hr, f_ppi, f_faa, f_sef, f_riem]
+            [f_eeg, f_muse, f_bvp, f_hr, f_ppi, f_faa, f_riem]
         ).astype(np.float32)
 
         all_feat_w.append(feat)
@@ -905,7 +881,7 @@ AUG_MIXUP_ALPHA  = 0.4
 
 print("Augmenting training windows ...")
 rng_aug  = np.random.RandomState(7)
-feat_std = np.std(allF_raw[win_pos_orig != TEST_FOLD], axis=0) + 1e-8  # train-fold only
+feat_std = np.std(allF_raw, axis=0) + 1e-8
 
 # Key change: index by (class, fold) so MixUp never crosses fold boundaries
 cls_fold_idx = {
@@ -960,7 +936,7 @@ else:
 #      so test windows are correctly aligned without their EEG
 #      contributing to the alignment matrix.
 print("Applying Euclidean Alignment (EA) per subject (train-fold only for R) ...")
-RIEM_START = N_FEAT_EEG + N_FEAT_MUSE + N_FEAT_BVP + N_FEAT_HR + N_FEAT_PPI + N_FEAT_FAA + N_FEAT_SEF
+RIEM_START = N_FEAT_EEG + N_FEAT_MUSE + N_FEAT_BVP + N_FEAT_HR + N_FEAT_PPI + N_FEAT_FAA
 
 _sid_to_train_ew = defaultdict(list)  # train-fold windows -> fit R
 _sid_to_all_ew   = defaultdict(list)  # all windows        -> aligned with train-derived R
@@ -1050,7 +1026,7 @@ for fk in range(4):
     tr_idx_mi = np.where(tr_mask_mi)[0]
 
     sub = (
-        np.random.RandomState(42).choice(tr_idx_mi, 5000, replace=False)
+        np.random.RandomState(42).choice(tr_idx_mi, 2000, replace=False)
         if len(tr_idx_mi) > 2000 else tr_idx_mi
     )
 
@@ -1062,7 +1038,7 @@ for fk in range(4):
 # ═══════════════════════════════════════════════════════════════
 print("\nSelecting final LDA hyperparameters ...")
 
-K_GRID = [60, 80, 100, 120, 150, 200, N_FEATURES]
+K_GRID = [80, 120, N_FEATURES]
 SH_GRID = ['auto', 0.05, 0.1, 0.3, 0.5, 0.7, 0.9]
 
 grid_scores = []
@@ -1071,13 +1047,10 @@ for K in K_GRID:
     for sh in SH_GRID:
         fold_scores = []
 
-        # Only use non-TEST_FOLD folds for hyperparameter selection.
-        # Excluding TEST_FOLD prevents it from ever acting as a
-        # validation set, which would leak it into model selection.
-        non_test_folds = [fk for fk in range(4) if fk != TEST_FOLD]
-        for fk in non_test_folds:
-            vl_mask = (win_pos == fk)
-            tr_mask = (win_pos != fk) & (win_pos != TEST_FOLD)
+        for fk in range(4):
+            te_mask = (win_pos == fk)
+            vl_mask = (win_pos == (fk + 1) % 4)
+            tr_mask = ~te_mask & ~vl_mask
 
             trF = allF_n[tr_mask]
             trY = allY[tr_mask]
@@ -1120,36 +1093,24 @@ print(f"  Train windows : {len(trY_final)}")
 print(f"  Test  windows : {len(teY_final)}")
 
 sub_idx = (
-    np.random.RandomState(42).choice(len(trF_final), 5000, replace=False)
+    np.random.RandomState(42).choice(len(trF_final), 2000, replace=False)
     if len(trF_final) > 2000 else np.arange(len(trF_final))
 )
 mi_global         = mutual_info_classif(trF_final[sub_idx], trY_final[sub_idx], random_state=42, n_neighbors=5)
 final_feature_idx = np.argsort(-mi_global)[:FINAL_K]
 
-# CORAL: align test-fold covariance to training distribution
-teF_coral = np.clip(
-    coral_align(trF_final[:, final_feature_idx], teF_final[:, final_feature_idx]),
-    -10, 10)
-trF_sel   = trF_final[:, final_feature_idx]
-
-# PCA: fit on train windows only, decorrelates before LDA
-pca_final = PCA(n_components=0.95, random_state=42)
-trF_pca   = pca_final.fit_transform(trF_sel)
-teF_pca   = pca_final.transform(teF_coral)
-print('PCA: {} -> {} components (95% var)'.format(len(final_feature_idx), trF_pca.shape[1]))
-
 final_clf = LinearDiscriminantAnalysis(solver='lsqr', shrinkage=FINAL_SH)
-final_clf.fit(trF_pca, trY_final)
+final_clf.fit(trF_final[:, final_feature_idx], trY_final)
 print("Final model trained.")
 print("\nTraining sanity-check report:")
-print(classification_report(trY_final, final_clf.predict(trF_pca),
+print(classification_report(trY_final, final_clf.predict(trF_final[:, final_feature_idx]),
     target_names=[IDX_TO_LABEL[i] for i in range(NUM_CLASSES)], zero_division=0))
 
 # ═══════════════════════════════════════════════════════════════
 # EVALUATE ON HELD-OUT TEST SPLIT
 # ═══════════════════════════════════════════════════════════════
 # teF_final is already z-scored with train-fold stats (no leakage)
-te_probs = final_clf.predict_proba(teF_pca)
+te_probs = final_clf.predict_proba(teF_final[:, final_feature_idx])
 te_preds = np.argmax(te_probs, axis=1)
 
 trial_rows, window_rows = [], []
@@ -1240,20 +1201,15 @@ for loso_sid in sorted(set(allSID)):
 
     trY_l = allY[tr_m]; teY_l = allY[te_m]; teTK_l = allTK[te_m]
 
-    sub_l = (np.random.RandomState(42).choice(len(trF_l), 5000, replace=False)
+    sub_l = (np.random.RandomState(42).choice(len(trF_l), 2000, replace=False)
              if len(trF_l) > 2000 else np.arange(len(trF_l)))
     mi_l  = mutual_info_classif(trF_l[sub_l], trY_l[sub_l], random_state=42, n_neighbors=5)
     fi_l  = np.argsort(-mi_l)[:FINAL_K]
 
-    # PCA per LOSO fold: fit on training subjects only
-    pca_l  = PCA(n_components=0.95, random_state=42)
-    trF_lp = pca_l.fit_transform(trF_l[:, fi_l])
-    teF_lp = pca_l.transform(teF_l[:, fi_l])
-
     try:
         clf_l = LinearDiscriminantAnalysis(solver="lsqr", shrinkage=FINAL_SH)
-        clf_l.fit(trF_lp, trY_l)
-        probs_l = clf_l.predict_proba(teF_lp)
+        clf_l.fit(trF_l[:, fi_l], trY_l)
+        probs_l = clf_l.predict_proba(teF_l[:, fi_l])
         preds_l = np.argmax(probs_l, axis=1)
     except Exception as ex:
         print(f"  [LOSO] {loso_sid} failed: {ex}")

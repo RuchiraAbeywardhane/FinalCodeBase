@@ -1318,6 +1318,16 @@ for loso_sid in sorted(set(allSID)):
     w_acc = float(np.mean(win_correct))
     loso_accs.append((loso_sid, w_acc, int(te_m.sum())))
     print(f"  Subject {loso_sid}: win_acc={w_acc:.3f}  n_wins={int(te_m.sum())}")
+    # per-subject class breakdown
+    _sub_rows = [r for r in loso_win_rows if r["subject"] == loso_sid]
+    if _sub_rows:
+        _yt = [r["true_idx"] for r in _sub_rows]
+        _yp = [r["pred_idx"] for r in _sub_rows]
+        print(classification_report(_yt, _yp,
+              target_names=[IDX_TO_LABEL[i] for i in range(NUM_CLASSES)],
+              zero_division=0, digits=2))
+        print(confusion_matrix(_yt, _yp, labels=list(range(NUM_CLASSES))))
+        print()
 
 pd.DataFrame(loso_trial_rows).to_csv("/kaggle/working/maxeffort_loso_trial.csv",  index=False)
 pd.DataFrame(loso_win_rows).to_csv(  "/kaggle/working/maxeffort_loso_window.csv", index=False)

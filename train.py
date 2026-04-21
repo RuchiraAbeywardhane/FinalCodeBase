@@ -44,6 +44,15 @@ def make_linear_svm(C=1.0):
     return CalibratedClassifierCV(base, cv=3, method='isotonic')
 
 
+from sklearn.svm import LinearSVC
+from sklearn.calibration import CalibratedClassifierCV
+
+def make_linear_svm(C=1.0):
+    base = LinearSVC(C=C, class_weight='balanced', max_iter=2000,
+                     random_state=42, dual=True)
+    return CalibratedClassifierCV(base, cv=3, method='isotonic')
+
+
 try:
     from pyriemann.estimation import Covariances as _PyrCov
     PYRIEMANN_OK = True
