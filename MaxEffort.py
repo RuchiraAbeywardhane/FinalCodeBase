@@ -1258,7 +1258,10 @@ loso_win_rows, loso_trial_rows, loso_accs = [], [], []
 
 for loso_sid in sorted(set(allSID)):
     te_m = (allSID == loso_sid) & ~allIS_AUG
-    tr_m = ~(allSID == loso_sid)
+    # FIX leakage: MixUp aug windows of other subjects may contain blended
+    # features from the test subject, so exclude ALL augmented windows from
+    # LOSO training. Only use real (non-augmented) windows of other subjects.
+    tr_m = (allSID != loso_sid) & ~allIS_AUG
     if te_m.sum() == 0 or tr_m.sum() == 0:
         continue
 
@@ -1290,11 +1293,39 @@ for loso_sid in sorted(set(allSID)):
 
     trY_l = allY[tr_m]; teY_l = allY[te_m]; teTK_l = allTK[te_m]
 
-    # MI feature selection
+    # MI feature selection -- computed on LOSO training subjects only (no leakage)
     sub_l  = (np.random.RandomState(42).choice(len(trF_l), 2000, replace=False)
               if len(trF_l) > 2000 else np.arange(len(trF_l)))
     mi_l   = mutual_info_classif(trF_l[sub_l], trY_l[sub_l], random_state=42, n_neighbors=5)
-    fi_l   = np.argsort(-mi_l)[:FINAL_K]
+
+    # FIX leakage: re-tune K and shrinkage using only LOSO training subjects.
+    # Use a quick 3-fold CV on training subjects to avoid using FINAL_K/FINAL_SH
+    # which were tuned on data that included the current test subject.
+    _loso_sids_tr = sorted(set(allSID[tr_m]))
+    _loso_K_grid  = [60, 100, 160]
+    _loso_sh_grid = [0.1, 0.3, 0.5]
+    _best_loso_val, _loso_K, _loso_sh = -1.0, 100, 0.3
+    if len(_loso_sids_tr) >= 3:
+        for _lk in _loso_K_grid:
+            for _lsh in _loso_sh_grid:
+                _lfi = np.argsort(-mi_l)[:_lk]
+                _lscores = []
+                for _vsid in _loso_sids_tr[:3]:   # quick 3-subject held-out
+                    _vm = np.array([allSID[i] == _vsid for i in np.where(tr_m)[0]])
+                    _tm = ~_vm
+                    if _vm.sum() == 0 or _tm.sum() == 0:
+                        continue
+                    try:
+                        _clf = make_lda(_lsh)
+                        _clf.fit(trF_l[_tm][:, _lfi], trY_l[_tm])
+                        _lscores.append(float((_clf.predict(trF_l[_vm][:, _lfi]) == trY_l[_vm]).mean()))
+                    except Exception:
+                        pass
+                if _lscores and float(np.mean(_lscores)) > _best_loso_val:
+                    _best_loso_val = float(np.mean(_lscores))
+                    _loso_K, _loso_sh = _lk, _lsh
+
+    fi_l   = np.argsort(-mi_l)[:_loso_K]
     trF_lk = trF_l[:, fi_l]
     teF_lk = teF_l[:, fi_l]
 
