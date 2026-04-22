@@ -785,6 +785,34 @@ def evaluate(model: BiMambaMSMDA, loader: DataLoader,
             clip_preds, clip_true, clip_pred_map)
 
 
+def print_classwise(title: str, y_true, y_pred):
+    """
+    Print a compact per-class accuracy table after each fold.
+    Columns: Class | Correct | Total | Acc | F1
+    """
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    print(f"\n  {title}")
+    print(f"  {'Class':<14} {'Correct':>8} {'Total':>7} {'Acc':>8} {'F1':>8}")
+    print(f"  {'-'*50}")
+    for ci in range(NUM_CLASSES):
+        name = IDX_TO_EMO[ci]
+        mask = y_true == ci
+        if mask.sum() == 0:
+            print(f"  {name:<14} {'---':>8} {'---':>7} {'---':>8} {'---':>8}")
+            continue
+        correct = int((y_pred[mask] == ci).sum())
+        total   = int(mask.sum())
+        acc_c   = correct / total
+        tp = correct
+        fp = int((y_pred == ci).sum()) - tp
+        fn = total - tp
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+        print(f"  {name:<14} {correct:>8} {total:>7} {acc_c:>8.3f} {f1:>8.3f}")
+
+
 # ================================================================
 # LOSO TRAINING LOOP
 # ================================================================
@@ -1191,13 +1219,17 @@ def main():
                 trial_pred_idx=pi, trial_pred_label=IDX_TO_EMO[pi]))
 
         loso_accs.append((loso_sid, w_acc, c_acc, c_f1, len(te_ev_lb)))
-        print(f"\n  Subject {loso_sid}: "
+        print(f"\n  Subject {loso_sid}:  "
               f"win_acc={w_acc:.3f}  clip_acc={c_acc:.3f}  clip_f1={c_f1:.3f}")
-        print(classification_report(w_lbls, w_preds,
-              target_names=[IDX_TO_EMO[i] for i in range(NUM_CLASSES)],
-              zero_division=0, digits=2))
-        print(confusion_matrix(w_lbls, w_preds,
-              labels=list(range(NUM_CLASSES))))
+        print_classwise("Window-level class breakdown:", w_lbls, w_preds)
+        print_classwise("Clip-level class breakdown:  ", c_lbls, c_preds)
+        print(f"\n  Confusion matrix (windows):")
+        cm = confusion_matrix(w_lbls, w_preds, labels=list(range(NUM_CLASSES)))
+        header = f"  {'':>14}" + "".join(f" {IDX_TO_EMO[i][:6]:>8}" for i in range(NUM_CLASSES))
+        print(header)
+        for ri in range(NUM_CLASSES):
+            row = f"  {IDX_TO_EMO[ri]:<14}" + "".join(f" {cm[ri,ci]:>8}" for ci in range(NUM_CLASSES))
+            print(row)
 
     # ── 6. Save & summarise ───────────────────────────────────────
     wdf = pd.DataFrame(loso_win_rows)
