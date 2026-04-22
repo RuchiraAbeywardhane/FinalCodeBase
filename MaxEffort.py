@@ -979,6 +979,27 @@ for sid in sorted(_sid_to_all_ew.keys()):
 
 print("EA done -- R fitted on train-fold only, applied to all windows (no test leakage).")
 
+# Cache per-subject mean SPD covariance for LOSO cross-subject EA.
+# LOSO: the test subject's R must be built from OTHER subjects only.
+_sid_mean_cov = {}
+for _s in sorted(_sid_to_train_ew.keys()):
+    _ews = _sid_to_train_ew[_s]
+    if len(_ews) >= 2:
+        _covs = [_regularised_cov(w.astype(np.float64)) for w in _ews]
+        _sid_mean_cov[_s] = np.stack(_covs).mean(axis=0)
+
+# Cache raw EEG window per global row index so LOSO can recompute
+# Riemannian features with the cross-subject R (no self-leakage).
+_gidx_to_eeg_win = {}
+for _s in sorted(_sid_to_all_ew.keys()):
+    _gidxs = _sid_to_gidx[_s]
+    for _k, _w in enumerate(_sid_to_all_ew[_s]):
+        if _k < len(_gidxs):
+            _gidx_to_eeg_win[_gidxs[_k]] = _w
+
+print(f"[EA cache] mean-cov for {len(_sid_mean_cov)} subjects; "
+      f"EEG windows cached for {len(_gidx_to_eeg_win)} rows.")
+
 # PREPROCESS  -  fit on non-test-fold windows only (no leakage)
 # ═══════════════════════════════════════════════════════════════
 print("\nApplying preprocessing (fit on non-TEST_FOLD windows only) ...")
@@ -1240,6 +1261,18 @@ for loso_sid in sorted(set(allSID)):
     tr_m = ~(allSID == loso_sid)
     if te_m.sum() == 0 or tr_m.sum() == 0:
         continue
+
+    # LOSO EA FIX: rebuild R from other subjects only, patch test-subject Riem features
+    _other_covs = [_sid_mean_cov[_s] for _s in _sid_mean_cov if _s != loso_sid]
+    if len(_other_covs) >= 1:
+        _R_cross    = np.stack(_other_covs).mean(axis=0)
+        _Rinv_cross = _matrix_sqrt_inv(_R_cross)
+        for _gi in np.where(te_m)[0]:
+            _w = _gidx_to_eeg_win.get(_gi)
+            if _w is not None:
+                allF_raw[_gi, RIEM_START:RIEM_START + N_FEAT_RIEM] = \
+                    extract_riemannian_features(
+                        np.array(_Rinv_cross @ _w.astype(np.float64), dtype=np.float32))
 
     # Fresh VT + z-score on training subjects only
     from sklearn.feature_selection import VarianceThreshold as _VT
