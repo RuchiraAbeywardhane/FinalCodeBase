@@ -375,8 +375,8 @@ class BiMambaMSMDA(nn.Module):
         # ② Discrepancy: keep target representations consistent across heads
         disc_loss = sum(
             torch.mean(torch.abs(
-                F.softmax(tgt_dsfe[mark], dim=1) -
-                F.softmax(tgt_dsfe[i],    dim=1)
+                F.softmax(self.cls_list[mark](tgt_dsfe[mark]), dim=1) -
+                F.softmax(self.cls_list[i](tgt_dsfe[i]),       dim=1)
             ))
             for i in range(self.n_sources) if i != mark
         )
@@ -525,8 +525,8 @@ def _lf_hf(ibi: np.ndarray, fs_ibi: float = 4.0):
         n    = max(int(len(ibi) / fs_ibi * fs_ibi), 8)
         iu   = sp_resample(ibi, n)
         f, p = welch(iu, fs=fs_ibi, nperseg=min(64, n))
-        lf   = float(np.trapz(p[(f>=0.04)&(f<0.15)], f[(f>=0.04)&(f<0.15)] + 1e-12))
-        hf   = float(np.trapz(p[(f>=0.15)&(f<0.40)], f[(f>=0.15)&(f<0.40)] + 1e-12))
+        lf   = float(np.trapz(p[(f>=0.04)&(f<0.15)] + 1e-12, f[(f>=0.04)&(f<0.15)]))
+        hf   = float(np.trapz(p[(f>=0.15)&(f<0.40)] + 1e-12, f[(f>=0.15)&(f<0.40)]))
         return max(lf, 0.0), max(hf, 0.0)
     except: return 0.0, 0.0
 
@@ -740,7 +740,7 @@ def evaluate(model: BiMambaMSMDA, loader: DataLoader,
              device: str, use_bvp: bool = False):
     """
     Returns (win_acc, win_f1, clip_acc, clip_f1,
-             win_preds, win_labels, clip_preds, clip_labels).
+             win_preds, win_labels, clip_preds, clip_labels, clip_pred_map).
     """
     model.eval()
     all_probs, all_labels, all_cids = [], [], []
@@ -769,18 +769,20 @@ def evaluate(model: BiMambaMSMDA, loader: DataLoader,
     win_f1  = f1_score(labels, preds, average="macro", zero_division=0)
 
     # Clip-level: uniform average of softmax probs per clip
-    clip_preds, clip_true = [], []
+    clip_preds, clip_true, clip_pred_map = [], [], {}
     for cid in np.unique(cids):
         m = cids == cid
-        clip_preds.append(int(probs[m].mean(axis=0).argmax()))
-        clip_true.append( int(labels[m][0]))
+        pred_cls = int(probs[m].mean(axis=0).argmax())
+        clip_preds.append(pred_cls)
+        clip_true.append(int(labels[m][0]))
+        clip_pred_map[int(cid)] = pred_cls
 
     clip_acc = float(np.mean(np.array(clip_preds) == np.array(clip_true)))
     clip_f1  = f1_score(clip_true, clip_preds, average="macro", zero_division=0)
 
     return (win_acc, win_f1, clip_acc, clip_f1,
             preds.tolist(), labels.tolist(),
-            clip_preds, clip_true)
+            clip_preds, clip_true, clip_pred_map)
 
 
 # ================================================================
@@ -843,6 +845,8 @@ def train_one_fold(model: BiMambaMSMDA,
 
                 # Ensure same batch size for MMD (drop extras)
                 bmin = min(sx.shape[0], tx.shape[0])
+                if bmin < 2:
+                    continue   # BatchNorm1d requires >= 2 samples
                 sx, sy, tx = sx[:bmin].to(device), sy[:bmin].to(device), tx[:bmin].to(device)
                 if sb is not None: sb = sb[:bmin]
                 if tb is not None: tb = tb[:bmin]
@@ -922,6 +926,8 @@ def main():
     all_sids     = np.array(all_sids)
     all_clip_ids = np.array(all_clip_ids)
     raw_bvp      = np.array(raw_bvp_feats, dtype=np.float32)
+    # Map trial key → clip_id for STEP_EV re-windowing inside the LOSO loop
+    tkey_to_clipid = {tk: int(cid) for tk, cid in zip(all_tkeys, all_clip_ids)}
     print(f"  Total windows: {len(all_labels)}  "
           f"Subjects: {len(set(all_sids))}\n")
 
@@ -1029,28 +1035,56 @@ def main():
         if n_sources == 0:
             print(f"  No sources -- skipping"); continue
 
-        # ── Target dataset: labels masked with zeros ──────────────
-        te_bw = torch.tensor(np.stack([band_all[i] for i in te_idx]),
-                              dtype=torch.float32)
-        te_bv = torch.tensor(norm_bvp[te_idx], dtype=torch.float32)
-        dummy = torch.zeros(len(te_idx), dtype=torch.long)   # labels hidden
-        ci_te = torch.tensor(all_clip_ids[te_idx], dtype=torch.long)
+        # ── Target dataset: re-windowed with STEP_EV (non-overlapping) ──
+        # Test subject is windowed at STEP_EV stride (no overlap) for evaluation,
+        # which avoids redundant/correlated predictions at clip-voting time.
+        te_trials_list = [tr for tr in trials if tr["sid"] == loso_sid]
+        te_ev_bw, te_ev_lb, te_ev_bv_raw, te_ev_ci, te_ev_tkeys = [], [], [], [], []
+        for tr in te_trials_list:
+            ev_wins = window_trial(tr["raw_eeg"], WIN_SAMPLES, STEP_EV)
+            cid     = tkey_to_clipid[tr["tkey"]]
+            bvp_raw = (bvp_lookup.get((tr["sid"], tr["emotion"]),
+                                      np.zeros(BVP_DIM, np.float32))
+                       if USE_BVP else np.zeros(BVP_DIM, np.float32))
+            for w in ev_wins:
+                aligned = Rinv_cross @ w.astype(np.float64)
+                te_ev_bw.append(apply_band_stack(aligned.astype(np.float32)))
+                te_ev_lb.append(tr["label"])
+                te_ev_bv_raw.append(bvp_raw)
+                te_ev_ci.append(cid)
+                te_ev_tkeys.append(tr["tkey"])
 
+        # Guard: skip fold if test subject produced no evaluation windows
+        if len(te_ev_bw) == 0:
+            print(f"  No STEP_EV windows for {loso_sid} -- skipping")
+            continue
+
+        # Normalise BVP with training-only stats (no leakage)
+        te_ev_bv_norm = (np.array(te_ev_bv_raw, dtype=np.float32) - bvp_mu) / bvp_sd
+        te_bw_t = torch.tensor(np.stack(te_ev_bw), dtype=torch.float32)
+        # Pass TRUE labels into tgt_ds -- training loop discards them (see unpack
+        # with _ below), so this is safe and makes evaluate() metrics meaningful.
+        te_lb_t = torch.tensor(te_ev_lb, dtype=torch.long)
+        te_ci_t = torch.tensor(te_ev_ci, dtype=torch.long)
         if USE_BVP:
-            tgt_ds = TensorDataset(te_bw, te_bv, dummy, ci_te)
+            tgt_ds = TensorDataset(te_bw_t,
+                                   torch.tensor(te_ev_bv_norm, dtype=torch.float32),
+                                   te_lb_t, te_ci_t)
         else:
-            tgt_ds = TensorDataset(te_bw, dummy, ci_te)
+            tgt_ds = TensorDataset(te_bw_t, te_lb_t, te_ci_t)
 
         tgt_inf_loader = DataLoader(tgt_ds, sampler=SequentialSampler(tgt_ds),
                                      batch_size=BATCH_SIZE, drop_last=False)
+        n_te_ev = len(te_ev_lb)   # STEP_EV window count for test subject
         tgt_trn_loader = DataLoader(tgt_ds, sampler=RandomSampler(tgt_ds),
-                                     batch_size=max(BATCH_SIZE, len(te_idx)//2+1),
+                                     batch_size=min(max(BATCH_SIZE, n_te_ev//2+1),
+                                                    n_te_ev),
                                      drop_last=True)
 
         # ── Validation: 15% of training subjects held out ─────────
         rem_sids = sorted(set(tr_sids))
         n_va     = max(1, int(0.15 * len(rem_sids)))
-        va_sids  = set(np.random.RandomState(SEED).choice(
+        va_sids  = set(np.random.RandomState(SEED + fi).choice(
                        rem_sids, n_va, replace=False))
         va_idx   = tr_idx[np.array([all_sids[i] in va_sids for i in tr_idx])]
         va_ds    = make_ds(va_idx, augment=False)
@@ -1058,6 +1092,11 @@ def main():
                                shuffle=False, drop_last=False)
 
         # ── Build fresh model for this fold ──────────────────────
+        try:
+            del model
+            torch.cuda.empty_cache()
+        except NameError:
+            pass
         model = BiMambaMSMDA(
             in_channels=IN_CHANNELS, d_model=D_MODEL, n_layers=N_LAYERS,
             d_state=D_STATE, patch_size=PATCH_SIZE,
@@ -1083,19 +1122,18 @@ def main():
                            device=DEVICE, use_bvp=USE_BVP)
             sched.step()
 
-            # SWA accumulate
-            swa_count += 1
+            # SWA accumulate (count only post-SWA_START snapshots)
             if epoch >= SWA_START:
+                swa_count += 1
                 curr = model.state_dict()
                 if swa_state is None:
                     swa_state = {k: v.cpu().float().clone() for k, v in curr.items()}
                 else:
-                    n = swa_count - SWA_START + 1
                     for k in swa_state:
-                        swa_state[k] += (curr[k].cpu().float() - swa_state[k]) / n
+                        swa_state[k] += (curr[k].cpu().float() - swa_state[k]) / swa_count
 
             # Validate
-            va_acc, _, va_clip_acc, va_clip_f1, _, _, _, _ = evaluate(
+            va_acc, _, va_clip_acc, va_clip_f1, _, _, _, _, _ = evaluate(
                 model, va_loader, DEVICE, USE_BVP)
 
             if epoch % 10 == 0 or epoch == 1:
@@ -1115,7 +1153,7 @@ def main():
                     break
 
         # Load SWA or best-val weights
-        if swa_state is not None and (swa_count - SWA_START) >= 3:
+        if swa_state is not None and swa_count >= 3:
             ref = model.state_dict()
             model.load_state_dict({k: swa_state[k].to(ref[k].dtype)
                                     for k in swa_state})
@@ -1125,16 +1163,16 @@ def main():
         model.to(DEVICE)
 
         # ── Evaluate on test subject ──────────────────────────────
-        w_acc, w_f1, c_acc, c_f1, w_preds, w_lbls, c_preds, c_lbls = \
+        w_acc, w_f1, c_acc, c_f1, w_preds, w_lbls, c_preds, c_lbls, clip_pred_map = \
             evaluate(model, tgt_inf_loader, DEVICE, USE_BVP)
 
-        teTK = all_tkeys[te_idx]
-        teY  = all_labels[te_idx]
+        teTK = np.array(te_ev_tkeys)
+        teY  = np.array(te_ev_lb)
 
-        for idx_w, gi in enumerate(te_idx):
+        for idx_w in range(len(te_ev_lb)):
             loso_win_rows.append(dict(
                 subject=loso_sid,
-                trial_key=all_tkeys[gi],
+                trial_key=te_ev_tkeys[idx_w],
                 window_idx=idx_w,
                 true_idx=int(teY[idx_w]),
                 true_label=IDX_TO_EMO[int(teY[idx_w])],
@@ -1142,23 +1180,17 @@ def main():
                 pred_label=IDX_TO_EMO[int(w_preds[idx_w])]))
 
         for tkey in sorted(set(teTK)):
-            m = teTK == tkey
-            tl= int(teY[m][0])
-            # use mean clip prob already computed in evaluate()
-            # find matching entry in c_preds/c_lbls
-            ci_unique = np.unique(all_clip_ids[te_idx[m]])
-            pi        = c_preds[list(np.unique(
-                            all_clip_ids[te_idx][
-                                np.array([all_tkeys[gi] == tkey
-                                          for gi in te_idx])]
-                        )).index(ci_unique[0])] if len(ci_unique) else tl
+            m  = teTK == tkey
+            tl = int(teY[m][0])
+            ci_unique = np.unique(np.array(te_ev_ci)[m])
+            pi = clip_pred_map.get(int(ci_unique[0]), tl) if len(ci_unique) else tl
             loso_trial_rows.append(dict(
                 subject=loso_sid, trial_key=tkey,
                 n_windows=int(m.sum()),
                 true_idx=tl, true_label=IDX_TO_EMO[tl],
                 trial_pred_idx=pi, trial_pred_label=IDX_TO_EMO[pi]))
 
-        loso_accs.append((loso_sid, w_acc, c_acc, c_f1, int(te_mask.sum())))
+        loso_accs.append((loso_sid, w_acc, c_acc, c_f1, len(te_ev_lb)))
         print(f"\n  Subject {loso_sid}: "
               f"win_acc={w_acc:.3f}  clip_acc={c_acc:.3f}  clip_f1={c_f1:.3f}")
         print(classification_report(w_lbls, w_preds,
