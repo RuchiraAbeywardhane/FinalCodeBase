@@ -384,8 +384,16 @@ class BiMambaMSMDA(nn.Module):
             disc_loss = torch.zeros(1, device=src_eeg.device).squeeze()
 
         # ③ Classification on labelled source
+        # Class weights boost gradient for hard classes (ENTHUSIASM, FEAR)
+        # that tend to collapse into each other under domain shift.
+        _w = torch.ones(len(self.cls_list[0].weight), device=src_eeg.device)
+        _w[0] = 1.5   # ENTHUSIASM
+        _w[1] = 1.5   # FEAR
+        _w[2] = 0.8   # NEUTRAL   (easier, down-weight slightly)
+        _w[3] = 0.8   # SADNESS   (easier, down-weight slightly)
         pred     = self.cls_list[mark](src_dsfe)
-        cls_loss = F.cross_entropy(pred, src_label.long())
+        cls_loss = F.cross_entropy(pred, src_label.long(), weight=_w,
+                                   label_smoothing=0.10)
 
         return cls_loss, mmd_loss, disc_loss
 
