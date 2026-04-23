@@ -948,9 +948,11 @@ def main():
     parser.add_argument("--min_trial_sec",type=float, default=5.0)
 
     # ── evaluation mode ──
-    parser.add_argument("--mode", choices=["loso", "sub_indep"],
+    parser.add_argument("--mode", choices=["loso", "sub_indep", "sub_dep"],
                         default="loso",
-                        help="loso = leave-one-subject-out (default)")
+                        help="loso=leave-one-subject-out (default) | "
+                             "sub_indep=70/15/15 split | "
+                             "sub_dep=subject-dependent 4-fold CV (upper bound)")
 
     # ── windowing ──
     parser.add_argument("--window_sec",   type=float, default=10.0)
@@ -1025,6 +1027,11 @@ def main():
           f" dropout={args.dropout}")
     print(f"  training    : lr={args.lr}, wd={args.weight_decay},"
           f" smooth={args.label_smooth}, patience={args.patience}")
+    if args.use_group_mmd:
+        print(f"  GroupMMD    : ON  n_groups={args.n_groups}"
+              f"  lambda={args.mmd_lambda}")
+    else:
+        print(f"  GroupMMD    : OFF  (enable with --use_group_mmd)")
     print(f"  device      : {device}")
     print(f"{'='*70}\n")
 
@@ -1431,8 +1438,8 @@ def main():
         print_report(all_c_true, all_c_preds,
                      title=f"LOSO Clip-Level {'EEG+BVP' if use_bvp else 'EEG-only'}")
 
-    else:
-        # ── 70/15/15 subject-independent split ────────────────────────────────
+    elif args.mode == 'sub_indep':
+        # ── 70/15/15 subject-independent split ─────────────────────────────────
         print("Step — Subject-independent split (70/15/15)...")
         tr_subjs, va_subjs, te_subjs = subject_split(
             subject_ids, seed=args.seed,
@@ -1460,6 +1467,101 @@ def main():
         print(f"  Clip   F1  : {c_f1:.4f}")
         print(f"  Chance     : {100/NUM_CLASSES:.1f}%")
         print_report(c_true, c_preds, title="sub_indep Clip-Level")
+
+    elif args.mode == 'sub_dep':
+        # ── Subject-Dependent: Global 4-Fold CV ──────────────────────────────
+        # Each subject's 4 emotion trials are randomly assigned one-to-one to
+        # 4 global folds (~41 trials/fold). No window-level leakage.
+        # test=fold k | val=fold (k+1)%4 | train=remaining 2 folds
+        # ─────────────────────────────────────────────────────────────────────
+        N_FOLDS      = 4
+        unique_subjs = sorted(set(subject_ids))
+        rng          = np.random.RandomState(args.seed)
+
+        trial_to_fold = {}
+        for subj in unique_subjs:
+            subj_trials = [i for i, s in enumerate(subject_ids) if s == subj]
+            shuffled    = list(subj_trials)
+            rng.shuffle(shuffled)
+            for fold_k, ti in enumerate(shuffled[:N_FOLDS]):
+                trial_to_fold[ti] = fold_k
+            for fold_k, ti in enumerate(shuffled[N_FOLDS:]):
+                trial_to_fold[ti] = fold_k % N_FOLDS
+
+        print(f"\n{'='*70}")
+        print(f"  SUBJECT-DEPENDENT  (Global 4-Fold CV)")
+        print(f"  train=2 folds | val=1 fold | test=1 fold")
+        print(f"  ~1 trial/subject per fold  |  Zero trial-level leakage")
+        print(f"  Upper-bound reference vs LOSO")
+        print(f"{'='*70}\n")
+        fold_counts = Counter(trial_to_fold.values())
+        for fk in range(N_FOLDS):
+            print(f"  Fold {fk}: {fold_counts.get(fk, 0)} trials")
+        print()
+
+        def _gd_folds(fold_ids):
+            idx = [i for i in range(len(labels))
+                   if trial_to_fold.get(i, -1) in fold_ids]
+            return ([processed_trials[i] for i in idx],
+                    [labels[i]            for i in idx],
+                    [subject_ids[i]       for i in idx],
+                    [emot_strs[i]         for i in idx])
+
+        all_sd_c_preds = []
+        all_sd_c_true  = []
+        sd_fold_accs   = []
+
+        for test_fold in range(N_FOLDS):
+            val_fold = (test_fold + 1) % N_FOLDS
+            tr_folds = {f for f in range(N_FOLDS)
+                        if f != test_fold and f != val_fold}
+
+            print(f"\n{'='*70}")
+            print(f"  SD-Fold {test_fold+1}/4 | "
+                  f"train=folds{sorted(tr_folds)} "
+                  f"val=fold{val_fold} test=fold{test_fold}")
+            print(f"{'='*70}")
+            setup_seed(args.seed + test_fold)
+
+            ta2, tl2, ts2, te2 = _gd_folds(tr_folds)
+            va2, vl2, vs2, ve2 = _gd_folds({val_fold})
+            xa2, xl2, xs2, xe2 = _gd_folds({test_fold})
+
+            print(f"  Sizes: train={len(tl2)} | val={len(vl2)} | "
+                  f"test={len(xl2)} trials")
+
+            (w2, wf2, wp2, wt2,
+             c2, cf2, cp2, ct2) = run_one_split(
+                ta2, tl2, ts2, te2,
+                va2, vl2, vs2, ve2,
+                xa2, xl2, xs2, xe2,
+                fold_name=f"SD{test_fold+1}")
+
+            print(f"  SD-Fold {test_fold+1}: "
+                  f"Win={w2:.4f}  Clip-Acc={c2:.4f}  Clip-F1={cf2:.4f}")
+
+            all_sd_c_preds.extend(cp2)
+            all_sd_c_true.extend(ct2)
+            sd_fold_accs.append(c2)
+
+        sd_ov_acc = float(np.mean(sd_fold_accs))
+        sd_ov_std = float(np.std(sd_fold_accs))
+        sd_ov_f1  = f1_score(all_sd_c_true, all_sd_c_preds,
+                             average='macro', zero_division=0)
+        print(f"\n{'='*70}")
+        print(f"  SUBJECT-DEPENDENT FINAL "
+              f"({'EEG+BVP' if use_bvp else 'EEG-only'}) / 4-Fold CV")
+        print(f"{'='*70}")
+        print(f"  Clip Acc : {sd_ov_acc:.4f}  ({sd_ov_acc*100:.1f}%)  mean over 4 folds")
+        print(f"  Std      : +/-{sd_ov_std:.4f}")
+        print(f"  Clip F1  : {sd_ov_f1:.4f}")
+        print(f"  Chance   : {100/NUM_CLASSES:.1f}%")
+        print(f"  Per-fold : "
+              + "  ".join(f"F{k+1}={a:.3f}" for k, a in enumerate(sd_fold_accs)))
+        print(f"\n  Compare with LOSO to see the personalisation gap:")
+        print(f"    SubDep={sd_ov_acc*100:.1f}%  vs  LOSO=?%")
+        print_report(all_sd_c_true, all_sd_c_preds,
+                     title="SubDep 4-Fold Clip-Level")
 
 
 if __name__ == "__main__":
