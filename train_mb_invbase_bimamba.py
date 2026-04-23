@@ -830,6 +830,104 @@ def print_report(y_true, y_pred, title: str = ""):
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  Group-MMD Domain Adaptation Utilities
+# ════════════════════════════════════════════════════════════════════════════
+
+def gaussian_mmd(X: torch.Tensor, Y: torch.Tensor,
+                 gammas=(0.5, 1.0, 2.0)) -> torch.Tensor:
+    """
+    Unbiased multi-kernel MMD² between two embedding matrices.
+
+    Uses several RBF bandwidths (gammas) and averages — more stable than
+    a single bandwidth when embedding norms vary across folds.
+
+    Args:
+        X: (n, d)  embeddings from group A
+        Y: (m, d)  embeddings from group B
+    Returns:
+        scalar MMD² (may be slightly negative due to unbiased estimator; clamp to 0)
+    """
+    def rbf_mean(A, B, gamma):
+        diff = A.unsqueeze(1) - B.unsqueeze(0)          # (n, m, d)
+        return torch.exp(-gamma * diff.pow(2).sum(-1))   # (n, m)
+
+    mmd = torch.zeros(1, device=X.device)
+    for g in gammas:
+        Kxx = rbf_mean(X, X, g).mean()
+        Kyy = rbf_mean(Y, Y, g).mean()
+        Kxy = rbf_mean(X, Y, g).mean()
+        mmd = mmd + Kxx + Kyy - 2.0 * Kxy
+    return (mmd / len(gammas)).clamp(min=0.0)
+
+
+def cluster_subjects(subj_list: list, baseline_info: dict,
+                     n_groups: int, seed: int = 42) -> dict:
+    """
+    Cluster subjects into n_groups based on their baseline EEG spectra.
+
+    Uses the flattened per-subject baseline power spectrum (already computed
+    for InvBase normalisation) as a compact subject representation.  Subjects
+    with similar resting-state EEG topology end up in the same group, making
+    intra-group domain alignment meaningful.
+
+    Falls back to round-robin assignment if baseline spectra are unavailable
+    for most subjects.
+
+    Args:
+        subj_list:     list of subject ID strings (training subjects only)
+        baseline_info: dict subj → spectrum (4, freq_bins)  OR
+                            subj → {'μ': ..., 'σ': ...}   (zscore mode)
+        n_groups:      number of clusters (k)
+        seed:          random seed for KMeans
+
+    Returns:
+        dict: subj_str → group_int  (0 … n_groups-1)
+    """
+    from sklearn.cluster import KMeans
+
+    vecs, valid_subjs = [], []
+    for s in subj_list:
+        info = baseline_info.get(s)
+        if info is None:
+            continue
+        # Handle both invbase (ndarray) and zscore (dict) modes
+        if isinstance(info, dict):
+            # zscore mode: concatenate μ and σ → (8,)
+            vec = np.concatenate([info['μ'], info['σ']]).astype(np.float32)
+        else:
+            # invbase mode: flatten (4, freq_bins) → (4*freq_bins,)
+            vec = np.asarray(info, dtype=np.float32).flatten()
+        vecs.append(vec)
+        valid_subjs.append(s)
+
+    # Ensure vectors are same length (truncate/pad to median length)
+    if vecs:
+        min_len = min(v.shape[0] for v in vecs)
+        vecs    = [v[:min_len] for v in vecs]
+
+    n_groups = min(n_groups, max(1, len(valid_subjs)))
+    subj_to_group = {}
+
+    if len(valid_subjs) >= n_groups and len(vecs) > 0:
+        X = np.stack(vecs)                              # (n_subj, features)
+        km = KMeans(n_clusters=n_groups, random_state=seed,
+                    n_init=10, max_iter=300)
+        labels = km.fit_predict(X)
+        for s, g in zip(valid_subjs, labels):
+            subj_to_group[s] = int(g)
+
+    # Subjects without baseline → round-robin fallback
+    missing = [s for s in subj_list if s not in subj_to_group]
+    for i, s in enumerate(missing):
+        subj_to_group[s] = i % n_groups
+
+    counts = Counter(subj_to_group.values())
+    print(f"  [GroupMMD] {n_groups} groups — sizes: "
+          + ", ".join(f"G{g}:{counts.get(g,0)}" for g in range(n_groups)))
+    return subj_to_group
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  Main
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -889,6 +987,18 @@ def main():
                              "(He & Wu 2019). NOTE: requires ≥10 trials per subject to "
                              "estimate stable mean covariance. DO NOT use with Emognition "
                              "(only 4 trials per subject) — will harm performance.")
+    # ── Group-MMD domain adaptation ──
+    parser.add_argument("--use_group_mmd", action="store_true", default=False,
+                        help="Enable subject-group MMD domain alignment. "
+                             "Clusters training subjects (by baseline EEG spectra) "
+                             "into --n_groups groups, then minimises MMD between "
+                             "group embeddings during training.")
+    parser.add_argument("--n_groups",   type=int,   default=5,
+                        help="Number of subject groups for GroupMMD (default: 5). "
+                             "Sweet spot for Emognition: 4–8.")
+    parser.add_argument("--mmd_lambda", type=float, default=0.01,
+                        help="Weight of MMD loss term: total = CE + λ·MMD "
+                             "(default: 0.01). Try 0.001–0.05.")
     parser.add_argument("--device",  type=str,
                         default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--overfit_test", action="store_true")
@@ -1048,10 +1158,12 @@ def main():
     def run_one_split(tr_proc, tr_lbl, tr_sub, tr_emot,
                       va_proc, va_lbl, va_sub, va_emot,
                       te_proc, te_lbl, te_sub, te_emot,
-                      fold_name=""):
+                      fold_name="", subj_to_group=None):
         """
         Build loaders, create model, train, and return test metrics.
         Returns (te_acc, te_f1, te_preds, te_labels).
+
+        subj_to_group: dict subj → group_int  (required when use_group_mmd=True)
         """
         step_tr = window_size // 2
         step_ev = window_size
@@ -1115,22 +1227,73 @@ def main():
         swa_count   = 0
         swa_active  = (args.swa_start > 0)
 
+        # ── build per-window group label tensor for MMD ──────────────────────
+        # Maps each training window to its subject's group ID.
+        use_mmd = args.use_group_mmd and subj_to_group is not None
+        if use_mmd:
+            tr_group_ids = torch.tensor(
+                [subj_to_group.get(s, 0) for s in tr_wsubs],
+                dtype=torch.long)
+        else:
+            tr_group_ids = None
+
+        # Rebuild train loader to also yield group ids when MMD is active
+        if use_mmd:
+            tr_ds_mmd = EmognitionMBDataset(
+                tr_wins, tr_wlbls, tr_bvp, tr_group_ids.tolist(), augment=True)
+            tr_dl = DataLoader(tr_ds_mmd, args.batch_size, shuffle=True,
+                               drop_last=False, num_workers=0, pin_memory=True)
+
         for epoch in range(1, args.epochs + 1):
             fold_model.train()
             ep_loss = ep_n = ep_ok = ep_tot = 0
+            ep_mmd  = 0.0
 
             for batch in tr_dl:
                 if use_bvp and len(batch) == 4:   # (eeg, bvp, label, clip_id)
-                    bx, bb, by, _ = batch
+                    bx, bb, by, grp = batch
                     bb = bb.to(device)
-                else:                              # (eeg, label, clip_id)
-                    bx, by, _ = batch[0], batch[1], batch[2]
+                else:                              # (eeg, label, clip_id/group_id)
+                    bx, by, grp = batch[0], batch[1], batch[2]
                     bb = None
-                bx = bx.to(device)
-                by = by.long().to(device)
+                bx  = bx.to(device)
+                by  = by.long().to(device)
+                grp = grp.to(device)
                 opt.zero_grad()
-                out  = fold_model(bx, bb) if use_bvp else fold_model(bx)
+
+                # ── forward + CE loss ────────────────────────────────────────
+                if use_bvp:
+                    emb = fold_model.backbone.get_embedding(bx)
+                    out = fold_model(bx, bb)
+                else:
+                    backbone_ref = (fold_model if not use_bvp
+                                    else fold_model.backbone)
+                    emb = backbone_ref.get_embedding(bx)
+                    out = fold_model(bx)
+
                 loss = crit(out, by)
+
+                # ── group MMD regularisation ─────────────────────────────────
+                if use_mmd:
+                    unique_grps = grp.unique()
+                    if len(unique_grps) >= 2:
+                        # Compute mean pairwise MMD across all group pairs
+                        mmd_val = torch.zeros(1, device=device)
+                        n_pairs = 0
+                        for gi in range(len(unique_grps)):
+                            for gj in range(gi + 1, len(unique_grps)):
+                                mask_i = (grp == unique_grps[gi])
+                                mask_j = (grp == unique_grps[gj])
+                                if mask_i.sum() < 2 or mask_j.sum() < 2:
+                                    continue
+                                mmd_val = mmd_val + gaussian_mmd(
+                                    emb[mask_i], emb[mask_j])
+                                n_pairs += 1
+                        if n_pairs > 0:
+                            mmd_val = mmd_val / n_pairs
+                            loss    = loss + args.mmd_lambda * mmd_val
+                            ep_mmd += mmd_val.item()
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(fold_model.parameters(), 1.0)
                 opt.step()
@@ -1156,12 +1319,13 @@ def main():
             monitor_f1 = va_clip_f1
 
             if epoch % 10 == 0 or epoch == 1:
-                tr_acc = ep_ok / max(ep_tot, 1)
+                tr_acc  = ep_ok / max(ep_tot, 1)
                 swa_tag = f" SWA×{swa_count}" if swa_count > 0 else ""
+                mmd_tag = f" MMD:{ep_mmd/max(ep_n,1):.4f}" if use_mmd else ""
                 print(f"  {fold_name} Ep{epoch:3d} | "
                       f"Tr:{tr_acc:.3f} | "
                       f"Va-win:{va_acc:.3f} Va-clip:{va_clip_acc:.3f} F1:{va_clip_f1:.3f} | "
-                      f"lr:{sched.get_last_lr()[0]:.1e}{swa_tag}")
+                      f"lr:{sched.get_last_lr()[0]:.1e}{swa_tag}{mmd_tag}")
 
             if monitor_f1 > best_f1:
                 best_f1 = monitor_f1
@@ -1223,6 +1387,14 @@ def main():
             tr_idx = [i for i in tr_all if subject_ids[i] not in va_subjs_f]
             va_idx = [i for i in tr_all if subject_ids[i] in va_subjs_f]
 
+            # ── Group-MMD: cluster training subjects (test subject excluded) ─
+            subj_to_group = None
+            if args.use_group_mmd:
+                tr_subjs_fold = sorted(set(subject_ids[i] for i in tr_idx))
+                subj_to_group = cluster_subjects(
+                    tr_subjs_fold, baseline_info,
+                    n_groups=args.n_groups, seed=args.seed + fi)
+
             def gd(idx):
                 return ([processed_trials[i] for i in idx],
                         [labels[i]            for i in idx],
@@ -1236,7 +1408,8 @@ def main():
             (w_acc, w_f1, w_preds, w_true,
              c_acc, c_f1, c_preds, c_true) = run_one_split(
                 ta, tl, ts, te_, va, vl, vs, ve, xa, xl, xs, xe,
-                fold_name=f"Fold{fi+1}")
+                fold_name=f"Fold{fi+1}",
+                subj_to_group=subj_to_group)
 
             print(f"  → Fold {fi+1} ({test_subj}): "
                   f"Win-Acc={w_acc:.4f}  Clip-Acc={c_acc:.4f}  Clip-F1={c_f1:.4f}")
